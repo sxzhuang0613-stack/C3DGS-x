@@ -21,7 +21,7 @@ def slice_tv_loss(images):
     return torch.abs(images[1:] - images[:-1]).mean()
 
 def anisotropic_scale_loss(scales, max_ratio=6.0, eps=1e-6, reference_count=None):
-    """固定参考容量避免 Birth 稀释正则；未指定时保持旧接口的均值。"""
+    """除以固定参考点数 N0，使每点正则梯度不随增殖/剪枝改变；未指定时保持旧接口的均值。"""
     if scales.numel() == 0:
         return scales.new_zeros(())
 
@@ -30,6 +30,11 @@ def anisotropic_scale_loss(scales, max_ratio=6.0, eps=1e-6, reference_count=None
     scale_ratio = max_scale / min_scale
     penalty = F.relu(scale_ratio / max_ratio - 1.0) ** 2
     return penalty.sum()/(scales.shape[0] if reference_count is None else reference_count)
+
+def envelope_loss(prediction, lower, upper):
+    """插层强度只需落在相邻两层之间；不强迫像素级淡入淡出，允许结构边界移动。"""
+    return (F.relu(lower-prediction)+F.relu(prediction-upper)).mean()
+
 
 # ============ ssim =========================
 

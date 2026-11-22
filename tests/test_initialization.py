@@ -19,7 +19,7 @@ from case_geometry import make_geometry, check_geometry, attach_geometry, save_m
 from CostFunctions import anisotropic_scale_loss
 from Gaussians.GaussianModel_structural import GaussianModel
 from Gaussians.initialization import IntensityOperator
-from stage1_test_support import NATIVE_AVAILABLE, reference_render
+from stage1_test_support import NATIVE_AVAILABLE, reference_render, alpha_train_config
 
 
 def reference_linear_render(model,img_size,slice_idx,axis,num_slices,**kwargs):
@@ -28,7 +28,7 @@ def reference_linear_render(model,img_size,slice_idx,axis,num_slices,**kwargs):
 
 class GeometryTests(unittest.TestCase):
     def setUp(self):
-        self.args = load_config(ROOT/'config_train.yaml')
+        self.args = alpha_train_config()
 
     def test_spacing_coordinates_agree_with_renderer_including_single_slice(self):
         for slices in (1,3):
@@ -61,7 +61,6 @@ class GeometryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'优化条件'):check_resume_config(saved,self.args)
 
     def test_dense_flow_uses_saved_pixel_centers_and_pixel_units(self):
-        from diff_gaussian_slice_rendering import GaussianRasterizationSettings as Settings
         from Motion import export_dense_flow
         class Translation(torch.nn.Module):
             def __init__(self):
@@ -81,16 +80,41 @@ class GeometryTests(unittest.TestCase):
             with np.load(path,allow_pickle=False) as result:
                 np.testing.assert_allclose(result['flow_pixel'][1],1.,rtol=1e-6)
                 check_geometry(json.loads(result['geometry_json'].item()),geometry)
-            cfg=Settings.from_axis(3,5,num_slices=1,bounds=geometry['bounds'])
             y,x=torch.meshgrid(torch.arange(3),torch.arange(5),indexing='ij')
-            pixels=torch.stack((x,y),-1).reshape(-1,2).double()
-            expected=pixels@cfg.slice_to_world[:3,:2].T+cfg.slice_to_world[:3,3]
+            bx,by,_=geometry['bounds']
+            expected=torch.stack((((x.flatten().double()+.5)*2/5-1)*bx,
+                                  ((y.flatten().double()+.5)*2/3-1)*by,
+                                  torch.zeros(15,dtype=torch.float64)),1)
             torch.testing.assert_close(net.queries[0].double(),expected,atol=1e-7,rtol=1e-6)
+
+
+class ReconstructionSnapshotTests(unittest.TestCase):
+    def test_full_case_snapshot_is_single_png_with_expected_slices(self):
+        """每次快照写一张"原图 | 渲染"拼图；插层期按 0.25 连续索引渲染 4(S-1)+1 张，否则只渲染 S 张整数层。"""
+        import GetInitialGaussian as stage1
+        from PIL import Image
+        model = SimpleNamespace(get_scaling=torch.full((2, 3), .1),
+                                _rotation=torch.tensor([[1., 0., 0., 0.]]).repeat(2, 1))
+        indices = []
+        def fake_render(_, img_size, slice_idx, **kwargs):
+            indices.append(slice_idx)
+            return {'render': torch.full(img_size, slice_idx/10.)}
+        images = torch.stack([torch.full((12, 16), k/10.) for k in range(5)])
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(stage1, 'render', side_effect=fake_render):
+            stage1.reconstruct_full_case(model, images, directory, 2000, False, .25, dpi=40)
+            self.assertEqual(indices, [0, 1, 2, 3, 4])
+            indices.clear()
+            stage1.reconstruct_full_case(model, images, directory, 6000, True, .25, dpi=40)
+            self.assertEqual(indices, [i*.25 for i in range(17)])
+            files = sorted(p.name for p in (Path(directory)/'reconstructions').iterdir())
+            self.assertEqual(files, ['iter_002000.png', 'iter_006000.png'])
+            Image.open(Path(directory)/'reconstructions'/'iter_006000.png').verify()
 
 
 class InitializationTests(unittest.TestCase):
     def setUp(self):
-        self.args = load_config(ROOT/'config_train.yaml')
+        self.args = alpha_train_config()
         self.args.num_pts = 48
         self.args.init_fit_steps = 8
         self.args.interpolation = False
@@ -112,12 +136,40 @@ class InitializationTests(unittest.TestCase):
         self.assertTrue(torch.equal(rng,torch.get_rng_state()))
         torch.testing.assert_close(first.get_xyz,second.get_xyz,rtol=0,atol=0)
         self.assertEqual(first.get_xyz.shape,(48,3))
-        self.assertTrue((first.get_xyz.abs() <= first.get_xyz.new_tensor(first.bounds)).all())
-        self.assertTrue((first.get_scaling.max(1).values/first.get_scaling.min(1).values <= self.args.init_max_axis_ratio+1e-5).all())
+        # 观测框按每层代表厚度 sz 的薄片定义，z 可越过首末层中心但不超出 S*sz/2。
+        self.assertTrue((first.get_xyz.abs() <= first._observation_box()+1e-6).all())
+        # 经典 3DGS 初始尺度：各向同性，sigma=sqrt(最近 3 个中心平方距离均值)，下界为 min_sigma_pixels。
+        from Gaussians.initialization import _mean_knn_sq_distance
+        floor = self.args.min_sigma_pixels*float(first._voxel_spacing()[:2].min())
+        expected = _mean_knn_sq_distance(first.get_xyz).sqrt().clamp_min(floor)
+        torch.testing.assert_close(first.get_scaling, expected[:,None].repeat(1,3))
         torch.testing.assert_close(first.get_rotation,torch.tensor([[1.,0.,0.,0.]]).repeat(48,1))
         self.assertLess(report['mse_after'],report['mse_before'])
         self.assertTrue(torch.isfinite(first.get_intensity).all())
         self.assertEqual(first.geometry_reference_count,48)
+
+    def test_remaining_invisible_points_are_dropped_after_retries(self):
+        """重试后仍无像素贡献的少量点被丢弃（不报错），点数与参考容量同步减少。"""
+        original = IntensityOperator.forward
+        def forward(operator, coefficients, visibility=False):
+            result = original(operator, coefficients, visibility)
+            if visibility:
+                result[1][0] = False
+            return result
+        with mock.patch.object(IntensityOperator, 'forward', forward):
+            model,_,report = self.initialize()
+        self.assertEqual((report['dropped_invisible'], report['count']), (1, 47))
+        self.assertEqual((len(model.get_xyz), model.geometry_reference_count), (47, 47))
+        self.assertTrue(all(len(getattr(model, name)) == 47 for name in ('_scaling','_rotation','_intensity')))
+
+    def test_knn_scale_matches_brute_force_definition(self):
+        """分块 kNN 与 distCUDA2 的定义一致：排除自身后最近 3 点平方距离均值；分块边界不影响结果。"""
+        from Gaussians.initialization import _mean_knn_sq_distance
+        points = torch.rand(257, 3, generator=torch.Generator().manual_seed(3))
+        distance = torch.cdist(points, points).square()
+        distance.fill_diagonal_(float('inf'))
+        expected = distance.topk(3, dim=1, largest=False).values.mean(1)
+        torch.testing.assert_close(_mean_knn_sq_distance(points, chunk=50), expected)
 
     def test_linear_operator_adjoint(self):
         model,images,_ = self.initialize()
@@ -161,7 +213,7 @@ class InitializationTests(unittest.TestCase):
 class CudaInitializationTests(unittest.TestCase):
     initialize = InitializationTests.initialize
     def setUp(self):
-        self.args = load_config(ROOT/'config_train.yaml')
+        self.args = alpha_train_config()
         self.args.num_pts = 24
         self.args.init_fit_steps = 8
 
@@ -203,6 +255,7 @@ class CudaInitializationTests(unittest.TestCase):
             args.checkpoint_interval=2;args.save_iterations=[1];args.reconstruct_interval=0
             args.densify_from_iter=1;args.densify_until_iter=3;args.densification_interval=1
             args.structural_min_observations=1;args.structural_grad_multiplier=0.
+            args.structure_log_interval=1;args.structural_prune_after_densify=False
             with mock.patch('GetInitialGaussian.update_loss_plot'):
                 training(args)
                 args.iters=3
@@ -214,9 +267,30 @@ class CudaInitializationTests(unittest.TestCase):
             record=read_model_geometry(ply)
             self.assertEqual(record['iteration'],3)
             self.assertEqual(record['geometry_reference_count'],24)
+            # 结构日志：续训截断后不重复；增殖窗口 [1,3) 内各有一次结构周期，第 3 步之后点数定型。
+            import csv
+            with open(ply.parent/'structure_log.csv',newline='') as stream:
+                rows=list(csv.DictReader(stream))
+            self.assertEqual([int(row['iteration']) for row in rows],[1,2,3])
+            self.assertEqual([int(row['structure_steps']) for row in rows],[1,1,0])
+            self.assertEqual(rows[-1]['grad_threshold'],'')
+            self.assertEqual(int(rows[-1]['points']),int(rows[-2]['points']))
             state=torch.load(ply.parent/'training_state.pth',map_location='cpu',weights_only=False)
             self.assertEqual(state['iteration'],3)
             check_geometry(state['geometry'],record['geometry'])
+            # 同一 PLY 经过真实评估入口，核对数据、几何记录与新版渲染接口。
+            from evaluate import evaluate
+            evaluation=load_config(ROOT/'config_test.yaml')
+            evaluation.render_model='innergs_alpha_fixed_v1'
+            evaluation.dataset_paths['acdc']=str(data_root)
+            evaluation.dataset_mode='all'
+            evaluation.stage1_ply_path=str(Path(args.output_path)/'{case}'/'point_cloud_final.ply')
+            evaluation.output_path=str(root/'evaluation')
+            evaluation.save_images=False
+            rows=evaluate(evaluation)
+            self.assertEqual(len(rows),2)
+            self.assertTrue((root/'evaluation'/'metrics.csv').is_file())
+            self.assertTrue((root/'evaluation'/'synthetic'/'reconstruction.npz').is_file())
 
 
 

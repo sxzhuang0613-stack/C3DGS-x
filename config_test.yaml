@@ -16,22 +16,17 @@ num_workers: 0
 pin_memory: true
 reference_phase: 0
 
-# 仅用于无几何记录的旧 PLY；新模型读取旁置几何记录
+# legacy_box 坐标边界；加载模型必须有旁置渲染和几何记录
 bounds: [1.0, 1.0, 1.0]
 legacy_color_policy: "strict"
 
-# 固定切片渲染参数（协方差 jitter 单位为模型坐标的平方）
+# 须与生成 PLY 的训练配置一致（geometry 记录逐项核对）；评估旧 alpha 结果时改回 "innergs_alpha_fixed_v1"
+render_model: "additive_slab_v1"
 background: 0.0
-# point 为加性点采样；gaussian 必须提供已知 PSF，不能从 slice spacing 推断。
-response_mode: "point"
-# 模型坐标单位的标准差；与 psf_std_vector 二选一，零值严格退化为 point。
-psf_sigma: 0.0
-# 非等比物理坐标变换后的一倍标准差位移 [vx,vy,vz]，默认不启用。
-psf_std_vector: null
-kernel_cutoff: 0.001
-cutoff_transition: 2.0
-covariance_jitter: 1.0e-08
 raster_debug: false
+# [additive] 与 config_train.yaml 相同：层面 FWHM（以层间距为单位）与幅值截断
+slice_thickness_fwhm_spacing: 1.0
+amplitude_cutoff: 0.00392156862745098
 
 # 训练/测试共用的 SSIM 定义，data_range 为归一化强度范围
 ssim_window_size: 5
@@ -41,7 +36,7 @@ ssim_k2: 0.03
 data_range: 1.0
 
 # 仅加载 Stage1 模型；{case} 替换 NPZ 文件主名
-stage1_ply_path: "./output/acdc_experiment/{case}/point_cloud_final.ply"
+stage1_ply_path: "/home/exouser/codes/OutPut/C3DGS/{case}/point_cloud_final.ply"
 
 # 输出与模型路径
 output_path: "./output/evaluation"

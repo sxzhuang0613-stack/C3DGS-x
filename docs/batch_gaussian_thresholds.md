@@ -1,6 +1,6 @@
-# 归一化切片的批量高斯操作与阈值校准
+# alpha 切片的批量高斯操作与阈值校准
 
-算法标识为 `batch_normalized_v1`，采用局部强度的归一化平均。
+结构算法标识为 `batch_residual_v5`（不做 Clone）。本文只描述结构操作；渲染模型语义由实际渲染库决定。
 
 ## 已实现的指标
 
@@ -11,66 +11,62 @@
 新 geometry 的 `[dx,dy,dz] = spacing_xyz / scale_mm`；legacy_box 则按 bounds 和输出尺寸换算。
 它表示移动一个体素的局部损失敏感度，不是屏幕梯度，也不是重建误差。
 统计使用总损失的 xyz 梯度，仍可能发生视图间抵消；受损失权重、切片采样数和插层阶段影响。
-不同条件下不应直接复制绝对梯度阈值。
+"可见"指候选半径 > 0 且强度梯度非零，即本步实际参与像素合成；`denom` 是满足该条件的训练迭代次数。
+仅当本统计周期 `denom >= structural_min_observations` 才允许增殖。
 
-仅当本统计周期 `denom >= structural_min_observations` 才允许增殖或弱幅值裁剪。
-`denom` 是看见该点的训练迭代次数，不是累计切片数或生命周期。
-实际梯度阈值为：
+梯度门限 `T = max(structural_grad_threshold, T_frozen)`，`T_frozen` 在首个结构周期取
+`structural_grad_multiplier * median(g_i > 0)` 后冻结并随 checkpoint 保存。
+相对中位数门限选中的比例只由梯度分布形状决定，与拟合好坏无关：patient001 实测每周期稳定选中
+29%–34%，点数每周期约 ×1.25，损失几乎不再下降。因此只用它标定一次。
 
-`T = max(structural_grad_threshold, structural_grad_multiplier * median(g_i > 0))`。
+每个结构周期全病例渲染一次做贡献审计。渲染对颜色线性，`dI_p/dc_i = T_i*alpha_i`，故：
 
-中位数只统计充分观测且梯度有限的点；没有正梯度时不增殖。
-中位数计算每个结构周期只做一次，不对候选按梯度排序。
+- 贡献质量 `W_i = sum_p T*alpha`（像素当量），与颜色无关；
+- 覆盖区平均残差 `E_i/W_i = sum_p T*alpha*|r_p| / W_i`（归一化强度单位）。
+
+增殖要求 `g_i >= T`、`E_i/W_i > structural_residual_threshold` 且 `W_i >= structural_support_min_weight`。W 不用于删除。
+误差降到 tau 以下的区域不再增殖，点数由剪枝收敛到平衡值。tau 是"可接受误差"旋钮，越小最终点数越多。
 
 面内尺度使用 `D^-1 R diag(sigma^2) R^T D^-1` 的 XY 子块最大特征值的平方根，
 其中 D 的 XY 分量为输出像素间距。实现使用 2×2 闭式公式，不做逐点 eigh。
-这是三维核的面内边缘投影尺度，不是逐切片条件 footprint，也不包含 PSF/jitter。
 它用于启发式区分大/小点，不能解释为精确的成像分辨率。
 
-## 第一轮建议值
+## 默认值
 
 | 参数 | 默认 | 含义 |
 |---|---:|---|
-| structural_grad_multiplier | 2.0 | 相对正梯度中位数的门限 |
-| structural_grad_threshold | 0.0 | 绝对梯度下限；0 表示尚未标定 |
+| structural_grad_multiplier | 2.0 | 首周期标定冻结门限的中位数倍数 |
+| structural_grad_threshold | 0.0 | 绝对梯度下限，与冻结值取大 |
+| structural_residual_threshold | 0.005 | 覆盖区平均残差门限，约为 ACDC 残差下限的 3 倍 |
+| structural_support_min_weight | 0.5 | 增殖支撑门：贡献质量下限（像素当量），只门控增殖，不删除 |
 | structural_min_observations | 8 | 一个统计周期内最低可见迭代数 |
-| structural_split_sigma_pixels | 2.0 | 大于 2 个输出像素标准差做 Split，否则 Clone |
-| structural_split_fraction | 0.35 | 子点偏移为父轴 sigma 的 0.35 倍 |
-| structural_clone_jitter | 0.05 | 仅新点扰动按父点局部 sigma 缩放 |
-| structural_growth_fraction | 0.05 | 每周期最多净增存活点数的 5%（向下取整） |
-| structural_prune_peak | 0.0 | 必须为零，仅清理无效点 |
+| structural_split_sigma_pixels | 2.5 | 候选点面内标准差大于 2.5 个输出像素才 Split；小点不增殖（无 Clone） |
+| structural_prune_after_densify | false | true 时增殖窗口后继续审计（剪除框外点、拆分尺寸超限点）；默认 densify_until_iter=10000 后高斯数目定型 |
+| structural_size_split_from_iter | 3000 | 从该步开始启用尺寸超限强制 Split |
+| structural_size_max_screen_radius | 20.0 | 本周期最大候选半径的像素上限，超过即拆分；0 关闭 |
+| structural_size_max_scale_ratio | 0.1 | 面内投影标准差 / max(bounds) 的上限，超过即拆分；不限制法向拉长；0 关闭 |
+| structural_prune_peak | 0.0 | 必须为零，不按颜色强度剪枝 |
+| min_sigma_pixels | 0.5 | 任一局部轴标准差下界（面内像素） |
 
-这些是初版工程起点，不是已通过真实病例实验得到的最优值。
-`sigma=2` 对应未截断高斯约 4.71 像素 FWHM，并非 2 像素直径。
+ACDC 缩放到 128 后面内约 1 mm/px，层间距 5–10 mm，心肌厚度 p10/中位数 5.6/7.5 mm。
+`sigma=2.5` 对应约 5.9 像素 FWHM，与较薄心肌相当。推导见 [结构算法实验记录](stage1_structural_experiments.md) 第 9 节。
+这些是由数据特性推得的理论起点，尚未在完整训练中逐项验证。
 
-## 如何相对准确地校准
+## 如何校准
 
-1. 先固定损失、切片采样、初始化和结构周期，在一个有代表性的病例上观察若干周期。
-   日志输出 `grad_median/grad_threshold/eligible/above_threshold/selected/budget/sigma_pixels_median`。
-   `above_threshold` 是限流前候选数，`selected` 是实际增殖父点数；不能只看后者判断梯度门限是否合适。
-2. 首先检查观测数。随机均匀采样时，一个只被一张切片看见的点，在长度 K 的窗口内期望约有
-   `K * min(real_slices_per_iter,S) / S` 次观测。最低观测数必须明显小于这个值；否则大量点永远不能调整。
-   例如 K=200、S=10、每步 2 张，约为 40 次，默认 8 次可作为起点。实际可见支持跨层时次数更高。
-3. 在不更改增长预算的情况下调整梯度倍数，例如比较 2、3、4。若限流前候选长期远超预算，
-   应提高倍数；若有明显残差但候选极少，先排查观测门限，再适当降低倍数。
-   候选比例不是正确性的证明，应同时检查全病例重建误差与点数。
-4. 相对中位数门限即使在接近收敛时仍可能选中噪声，因此不要把绝对下限长期视为无需设置。
-   当重建误差已达到可接受水平时，记录若干周期的相对阈值 T，以其典型水平作为绝对下限的起点。
-   后续使用 `max(绝对下限, 自适应阈值)`；该方法只提供数据驱动初值，需对低梯度但仍未拟合的区域复核。
-5. 尺度阈值按输出像素设置。优先在 1.5–3.0 像素 sigma 范围做小规模比较。
-   若 Split 持续主导且细节没有改善，适当增大阈值；若宽核残差明显而主要发生 Clone，适当降低。
-   不用层间距替代面内像素尺度。输出分辨率、PSF 或图像 resize 改变后需重新校准。
-6. 保持 `split_fraction=0.35` 起步；其子轴 sigma 因子为 sqrt(1-0.35²)，约 0.937。
-   若一次结构操作扰动过大，先降低增长比例或位置扰动，而非同时修改多个阈值。
-   子点尺度若会低于 log_scale_min，本轮不分裂该父点。
-7. 不按颜色幅值裁剪。暗色点也通过分母控制局部插值，删除后可能使结果变亮。
-   本版仅清理无效点，以增长预算和最大容量控制点数；不做逐点删除验收或额外渲染。
+1. 在一个有代表性的病例上跑完整训练，观察每周期日志 `selected/split/split_size/pruned_box/
+   residual_high/grad_threshold/weight_median/error_median` 与点数曲线。预期点数先升、增速衰减、最后平稳。
+2. 检查观测数。随机均匀采样时，只被一张切片看见的点在长度 K 的窗口内期望约有
+   `K * min(real_slices_per_iter,S) / S` 次观测；K=200、S=10、每步 2 张约 40 次，默认 8 次可作为起点。
+3. tau（`structural_residual_threshold`）决定平衡点数：误差不再改善而点数仍增长时增大 tau；
+   残差明显但候选极少时降低 tau 或检查冻结梯度门限。若每周期新增与剪枝都很大且相互抵消，说明 tau 低于可达误差。
+4. `structural_support_min_weight` 以像素当量计；`min_sigma_pixels=0.5` 时单层未遮蔽最小核约 1.5 像素当量，0.5 不会挡住合法细点的增殖。
+5. 尺度阈值按输出像素设置，输出分辨率、渲染定义或图像 resize 改变后需重新校准；不用层间距替代面内像素尺度。
+6. 不按颜色幅值裁剪；W 与颜色无关，暗色组织只要参与合成就保留。若剪枝后点数少于 structural_min_points，在提交前报错并保留原模型。
 
 ## 验证标准与限制
 
-比较同一配置、相同随机种子下达到同等全病例 L1/SSIM 的总用时、最终点数及结构操作后的损失跳变。
-插层开启前后分开观察。不要只比较单步速度，也不要预设增加迭代必然补偿结构误差。
-Clone 保留父点与动量，仅扰动新点；Clone/Split 均直接继承局部强度，不均分或补偿颜色。
-Split 的对称几何初始化保持等权分布的中心和二阶矩，不保证子核之和或归一化输出不变。
-位置梯度在同色或单点主导区域可能很弱，首版不增加残差统计或额外 CUDA 计数。
-当前不实现独立 Birth、Merge、Swap、未观测点超时裁剪或结构目标验收。
+比较同一配置、相同随机种子下的最终点数、全病例 L1/SSIM 与结构操作后的损失跳变；插层效果另用留层验证比较。
+Split 子点直接继承局部强度，不均分或补偿颜色，不保证混合输出不变；结构调整允许短期损失上升。
+梯度统计仍可能存在视图间抵消（可参考 AbsGS 的逐像素绝对梯度），当前未实现。
+当前不实现独立 Birth、Merge、Swap 或结构目标验收。

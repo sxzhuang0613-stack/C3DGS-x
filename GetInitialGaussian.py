@@ -1,14 +1,15 @@
+import csv
 import os
 import torch
 from Gaussians.GaussianModel_structural import GaussianModel
 from Gaussians.utils import covariance_from_scaling_rotation
 from Dataloader import dataset
-from CostFunctions import l1_loss, ssim, anisotropic_scale_loss
+from CostFunctions import l1_loss, ssim, anisotropic_scale_loss, envelope_loss
 from Renderer import render
 import argparse
 import random
 import numpy as np
-from config_utils import load_config, setup_runtime, dataset_options, ssim_options
+from config_utils import load_config, setup_runtime, dataset_options, ssim_options, RENDER_SEMANTICS
 from case_geometry import make_geometry, check_geometry, attach_geometry, save_model_ply, read_model_geometry
 from tqdm import tqdm
 
@@ -51,35 +52,97 @@ def update_loss_plot(out_dir, iters_list, loss_dict, dpi=150):
     plt.close('all')
 
 # ==================== [功能模块 2: 周期性全序列快照重建 (含插帧联动)] ====================
-def reconstruct_full_case(Gaussians, s, h, w, out_dir, iter_num, include_interp, step_size=0.5, **render_kwargs):
-    """重建当前模型在整个 Case 下的所有切片。如果已进入插帧期，将自动采用亚像素步长进行细分插帧"""
-    rec_dir = os.path.join(out_dir, "reconstructions", f"iter_{iter_num:06d}")
+def reconstruct_full_case(Gaussians, imgs, out_dir, iter_num, include_interp, step_size=0.25,
+                          dpi=150, similarity=None, **render_kwargs):
+    """渲染整个病例并与原图并排拼成一张 PNG：reconstructions/iter_XXXXXX.png。
+
+    imgs 为参考相位原图 [S,H,W]。每个真实层显示"原图 | 渲染"并标注该层 PSNR/SSIM；
+    进入插层训练后，同一行再接 k+step, k+2*step, ... 的插值渲染（无原图，不计指标）。
+    固定 [0,1] 灰度、最近邻显示，避免显示插值造成的额外模糊。
+    """
+    rec_dir = os.path.join(out_dir, "reconstructions")
     os.makedirs(rec_dir, exist_ok=True)
-    
+    s, h, w = imgs.shape
+    per_interval = max(1, round(1 / step_size)) if include_interp else 1
+
     with torch.no_grad():
         covariance = covariance_from_scaling_rotation(Gaussians.get_scaling, Gaussians._rotation)
-        if include_interp:
-            # 自动计算插帧序列：例如 s=10, step=0.5，则生成 0.0, 0.5, 1.0 ... 9.0
-            num_steps = int((s - 1) / step_size) + 1
-            slice_indices = [min(i * step_size, s - 1) for i in range(num_steps)]
-            if slice_indices[-1] < s - 1:
-                slice_indices.append(float(s - 1))
-        else:
-            # 基础序列：只重现原始的整数切片 0, 1, 2...
-            slice_indices = list(range(s))
-            
-        
-        for idx in slice_indices:
-            render_pkg = render(Gaussians, img_size=[h, w], slice_idx=idx, axis=2,
-                                num_slices=s, covariance=covariance, **render_kwargs)
-            pred_tensor = render_pkg['render'].clamp(0, 1).cpu().numpy()
-            
-            # 命名支持浮点数：如 slice_000.00.png, slice_000.50.png
-            file_name = f"slice_{idx:05.2f}.png"
-            plt.imsave(os.path.join(rec_dir, file_name), pred_tensor, cmap='gray', vmin=0, vmax=1)
-            
-    plt.close('all')
+        def view(index):
+            return render(Gaussians, img_size=[h, w], slice_idx=index, axis=2, num_slices=s,
+                          covariance=covariance, **render_kwargs)['render']
+        rows = []
+        for k in range(s):
+            prediction = view(k)
+            mse = (prediction - imgs[k]).square().mean().clamp_min(1e-12)
+            psnr_value = float(10 * torch.log10(1 / mse))
+            ssim_value = float(ssim(prediction[None, None], imgs[k][None, None], **(similarity or {})))
+            # 插值层：k+step ... k+1-step，最后一层之后没有区间。
+            interps = [(k + j * step_size, view(min(k + j * step_size, s - 1)).clamp(0, 1).cpu().numpy())
+                       for j in range(1, per_interval) if k < s - 1]
+            rows.append((k, imgs[k].cpu().numpy(), prediction.clamp(0, 1).cpu().numpy(),
+                         psnr_value, ssim_value, interps))
+
+    # 插层期每行对应一个真实层：原图、渲染、插值；否则每行放两组"原图 | 渲染"。
+    pairs_per_row = 1 if include_interp else 2
+    cols = (2 + per_interval - 1) if include_interp else 2 * pairs_per_row
+    nrows = int(np.ceil(len(rows) / pairs_per_row))
+    fig, axes = plt.subplots(nrows, cols, figsize=(1.7 * cols, 1.95 * nrows), squeeze=False)
+    for ax in axes.flat:
+        ax.axis('off')
+    show = dict(cmap='gray', vmin=0, vmax=1, interpolation='nearest')
+    for n, (k, gt, prediction, psnr_value, ssim_value, interps) in enumerate(rows):
+        r, c = divmod(n, pairs_per_row)
+        c *= cols // pairs_per_row
+        axes[r, c].imshow(gt, **show)
+        axes[r, c].set_title(f"GT {k}", fontsize=8)
+        axes[r, c + 1].imshow(prediction, **show)
+        axes[r, c + 1].set_title(f"render {k}\nPSNR {psnr_value:.1f} SSIM {ssim_value:.3f}", fontsize=7)
+        for j, (index, image) in enumerate(interps):
+            axes[r, c + 2 + j].imshow(image, **show)
+            axes[r, c + 2 + j].set_title(f"render {index:.2f}", fontsize=8, color='tab:blue')
+    mean_psnr = np.mean([row[3] for row in rows])
+    mean_ssim = np.mean([row[4] for row in rows])
+    fig.suptitle(f"iter {iter_num}   per-slice mean PSNR {mean_psnr:.2f} dB   SSIM {mean_ssim:.4f}"
+                 + ("   (blue = interpolated)" if include_interp else ""), fontsize=10)
+    # 为总标题预留约 0.4 英寸，避免与首行子图标题重叠。
+    fig.tight_layout(rect=(0, 0, 1, 1 - .4 / fig.get_figheight()))
+    fig.savefig(os.path.join(rec_dir, f"iter_{iter_num:06d}.png"), dpi=dpi)
+    plt.close(fig)
     torch.cuda.empty_cache()
+
+# ==================== [功能模块 3: 结构操作日志] ====================
+# 计数类字段在窗口内求和；门限/中位数取窗口内最后一次结构周期的值；points 为写入时的实际点数。
+STRUCTURE_COUNT_FIELDS = ('split', 'split_size', 'split_normal', 'pruned', 'pruned_box',
+                          'pruned_invisible', 'selected', 'residual_high', 'eligible')
+STRUCTURE_LAST_FIELDS = ('grad_threshold', 'grad_median', 'normal_threshold', 'normal_median',
+                         'weight_median', 'error_median', 'sigma_pixels_median')
+STRUCTURE_FIELDS = ('iteration', 'points', 'structure_steps') + STRUCTURE_COUNT_FIELDS + STRUCTURE_LAST_FIELDS
+
+
+def prepare_structure_log(path, start_iteration):
+    """新训练覆盖日志；续训只保留不超过起点的行，避免中断后重复记录。"""
+    rows = []
+    if start_iteration > 0 and os.path.isfile(path):
+        with open(path, newline='', encoding='utf-8') as stream:
+            rows = [row for row in csv.DictReader(stream) if int(row['iteration']) <= start_iteration]
+    with open(path, 'w', newline='', encoding='utf-8') as stream:
+        # 旧版日志可能含已取消的列（如 clone），续训时忽略。
+        writer = csv.DictWriter(stream, fieldnames=STRUCTURE_FIELDS, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def append_structure_log(path, iteration, points, reports):
+    """把一个日志窗口内的结构周期报告汇总为一行；窗口内无结构操作时计数为 0。
+
+    两种结构算法的报告字段不完全相同，缺失的计数记 0、缺失的门限/中位数留空。
+    """
+    row = dict(iteration=iteration, points=points, structure_steps=len(reports))
+    row.update({key: sum(report.get(key, 0) for report in reports) for key in STRUCTURE_COUNT_FIELDS})
+    row.update({key: reports[-1].get(key, '') if reports else '' for key in STRUCTURE_LAST_FIELDS})
+    with open(path, 'a', newline='', encoding='utf-8') as stream:
+        csv.DictWriter(stream, fieldnames=STRUCTURE_FIELDS).writerow(row)
+
 
 def save_training_checkpoint(path, gaussians, iteration, history_iters, history_losses, args):
     """保存拓扑、Adam 动量、增殖统计和随机状态；PLY 只用于交换模型。"""
@@ -90,8 +153,9 @@ def save_training_checkpoint(path, gaussians, iteration, history_iters, history_
         'parameters': {name: getattr(gaussians, name).detach() for name in
                        ('_xyz', '_intensity', '_scaling', '_rotation')},
         'optimizer': gaussians.optimizer.state_dict(),
-        'statistics': {name: getattr(gaussians, name) for name in
-                       ('xyz_gradient_accum', 'denom', 'max_radii2D')},
+        'statistics': {name: getattr(gaussians, name) for name in gaussians.statistic_names},
+        'structural_grad_reference': gaussians.structural_grad_reference,
+        'structural_normal_reference': gaussians.structural_normal_reference,
         'history_iters': history_iters, 'history_losses': history_losses,
         'random': random.getstate(), 'numpy': np.random.get_state(),
         'torch': torch.get_rng_state(), 'cuda': torch.cuda.get_rng_state_all(),
@@ -102,9 +166,12 @@ def save_training_checkpoint(path, gaussians, iteration, history_iters, history_
 def restore_training_checkpoint(state, gaussians, args):
     check_resume_config(state['config'], args)
     geometry = state.get('geometry')
+    semantics = RENDER_SEMANTICS[args.render_model]
     if (geometry is None or geometry.get('render_model') != args.render_model
-            or geometry.get('intensity_semantics') != 'local_value'):
-        raise ValueError('checkpoint 缺少匹配的归一化渲染记录，不能恢复为新模型')
+            or geometry.get('intensity_semantics') != semantics['intensity']
+            or geometry.get('opacity_mode') != semantics['opacity']
+            or geometry.get('rasterizer_api_version') != semantics['api']):
+        raise ValueError('checkpoint 缺少匹配的渲染语义记录，不能恢复为当前模型')
     attach_geometry(gaussians,geometry)
     for name, tensor in state['parameters'].items():
         setattr(gaussians, name, torch.nn.Parameter(tensor.to(args.device)))
@@ -113,13 +180,15 @@ def restore_training_checkpoint(state, gaussians, args):
     gaussians.optimizer.load_state_dict(state['optimizer'])
     for name, tensor in state['statistics'].items():
         setattr(gaussians, name, tensor.to(args.device))
+    gaussians.structural_grad_reference = state['structural_grad_reference']
+    gaussians.structural_normal_reference = state.get('structural_normal_reference')
     random.setstate(state['random'])
     np.random.set_state(state['numpy'])
     torch.set_rng_state(state['torch'].cpu())
     torch.cuda.set_rng_state_all([value.cpu() for value in state['cuda']])
 
 def check_resume_config(saved, args):
-    # 加性幅度与局部强度语义不同，不自动转换旧参数或 Adam 状态。
+    # 旧渲染模型与固定 opacity 的 alpha 合成语义不同，不自动转换旧参数或 Adam 状态。
     if saved.get('render_model') != args.render_model:
         raise ValueError('渲染模型已改变，不能完整续训；请使用新的实验输出目录')
     if saved.get('structural_algorithm') != args.structural_algorithm:
@@ -127,12 +196,13 @@ def check_resume_config(saved, args):
     # 允许延长训练和改变输出频率；优化目标或 Adam 参数改变时应参数热启动。
     keys = ('position_lr_init','position_lr_final','position_lr_max_steps','position_lr_delay_mult',
             'intensity_lr','scaling_lr','rotation_lr','adam_eps','adam_betas',
-            'log_scale_min','log_scale_max','real_slices_per_iter','interpolation',
+            'log_scale_min','log_scale_max','min_sigma_pixels','real_slices_per_iter','interpolation',
             'interpolate_iter','interpolation_probability','interpolation_alpha_min',
             'interpolation_alpha_max','anisotropic_max_ratio','anisotropic_epsilon',
-            'densify_from_iter','densify_until_iter','densification_interval','max_num_pts',
+            'densify_from_iter','densify_until_iter','densification_interval',
             'lambda_l1','lambda_ssim','lambda_anisotropic','lambda_interp_l1','lambda_interp_ssim',
-            'background','raster_debug')
+            'lambda_interp_envelope',
+            'background','raster_debug','slice_thickness_fwhm_spacing','amplitude_cutoff')
     keys = set(keys)|{key for key in vars(args) if key.startswith('structural_')}
     changed = sorted(key for key in keys if key in saved and saved[key] != getattr(args,key))
     if changed:
@@ -171,11 +241,11 @@ def training(args):
         if state is not None and (args.stage1_resume or skip_existing):
             geometry = state.get('geometry')
             if geometry is None:
-                raise ValueError('旧 checkpoint 缺少渲染和几何记录，不能按归一化模型恢复')
+                raise ValueError('旧 checkpoint 缺少渲染和几何记录，不能按 alpha 模型恢复')
         elif args.warm_start_ply_path:
             record = read_model_geometry(args.warm_start_ply_path)
             if record is None:
-                raise ValueError('PLY 缺少局部强度及渲染语义记录，不能自动解释为归一化模型')
+                raise ValueError('PLY 缺少局部强度及渲染语义记录，不能自动解释为 alpha 模型')
             geometry = record['geometry']
         else:
             geometry = make_geometry(data['info']['spacing_xyz'][0],imgs.shape,args)
@@ -210,6 +280,12 @@ def training(args):
             gaussians.prune_points(gaussians._invalid_point_mask())
         if gaussians.get_xyz.shape[0] == 0:
             raise FloatingPointError(f'{sample_name}: 没有有效高斯点，无法开始优化')
+        structure_log = os.path.join(case_dir, 'structure_log.csv')
+        prepare_structure_log(structure_log, start_iteration)
+        structure_reports = []
+        # 加和模型用逐切片梯度统计 + 闭式判据；旧 alpha 模型保持原残差门控流程
+        additive = args.structural_algorithm == 'additive_moment_v1'
+        structural_step = gaussians.structural_step_additive if additive else gaussians.structural_step
         pbar = tqdm(range(start_iteration + 1, args.iters + 1),
                     desc=f'Case [{sample_idx + 1}/{len(loader)}] {sample_name}')
         for iteration in pbar:
@@ -220,6 +296,8 @@ def training(args):
             indices = random.sample(range(s), min(s, args.real_slices_per_iter))
             outputs = [render(gaussians, [h, w], index, 2, s, covariance=covariance, **rendering)
                        for index in indices]
+            # 结构统计只用真实切片；插层平面没有观测，不参与增殖判据
+            real_outputs = list(zip(outputs, indices))
             predictions = torch.stack([output['render'] for output in outputs])[:, None]
             targets = imgs[indices, None]
             loss_l1 = l1_loss(predictions, targets)
@@ -227,54 +305,68 @@ def training(args):
             loss_aniso = anisotropic_scale_loss(
                 gaussians.get_scaling, args.anisotropic_max_ratio, args.anisotropic_epsilon,
                 reference_count=gaussians.geometry_reference_count)
-            loss_interp_l1 = imgs.new_zeros(())
-            loss_interp_ssim = imgs.new_zeros(())
+            zero = imgs.new_zeros(())
+            loss_interp_l1, loss_interp_ssim, loss_envelope = zero, zero, zero
             if args.interpolation and iteration >= args.interpolate_iter and s > 1:
                 if random.random() < args.interpolation_probability:
                     alpha = random.uniform(args.interpolation_alpha_min,
                                            args.interpolation_alpha_max)
                     left = random.randrange(max(1, s - 2))
                     intervals = range(left, min(left + 2, s - 1))
-                    interp_outputs, interp_targets = [], []
+                    interp_pred, lower, upper = [], [], []
                     for index in intervals:
-                        interp_outputs.append(render(
-                            gaussians, [h, w], index + alpha, 2, s,
-                            covariance=covariance, **rendering)['render'])
-                        interp_targets.append((1 - alpha) * imgs[index] + alpha * imgs[index + 1])
-                    interp_pred = torch.stack(interp_outputs)[:, None]
-                    interp_gt = torch.stack(interp_targets)[:, None]
+                        output = render(gaussians, [h, w], index + alpha, 2, s,
+                                        covariance=covariance, **rendering)
+                        outputs.append(output)
+                        interp_pred.append(output['render'])
+                        lower.append(torch.minimum(imgs[index], imgs[index + 1]))
+                        upper.append(torch.maximum(imgs[index], imgs[index + 1]))
+                    # 无层间真值：区间约束防止越界伪影，不拟合像素级线性混合（避免双重轮廓）。
+                    loss_envelope = envelope_loss(torch.stack(interp_pred), torch.stack(lower),
+                                                  torch.stack(upper))
                 else:
                     index = random.randrange(s)
-                    interp_pred = render(gaussians, [h, w], index, 2, s,
-                                         covariance=covariance, **rendering)['render'][None, None]
+                    output = render(gaussians, [h, w], index, 2, s, covariance=covariance, **rendering)
+                    outputs.append(output)
+                    real_outputs.append((output, index))
+                    interp_pred = output['render'][None, None]
                     interp_gt = imgs[index][None, None]
-                loss_interp_l1 = l1_loss(interp_pred, interp_gt)
-                loss_interp_ssim = 1 - ssim(interp_pred, interp_gt, **similarity)
+                    loss_interp_l1 = l1_loss(interp_pred, interp_gt)
+                    loss_interp_ssim = 1 - ssim(interp_pred, interp_gt, **similarity)
             loss = (args.lambda_l1 * loss_l1 + args.lambda_ssim * loss_ssim
                     + args.lambda_anisotropic * loss_aniso
                     + args.lambda_interp_l1 * loss_interp_l1
-                    + args.lambda_interp_ssim * loss_interp_ssim)
-            # if not torch.isfinite(loss):
-            #     raise FloatingPointError(f'{sample_name}: 第 {iteration} 步损失非有限')
+                    + args.lambda_interp_ssim * loss_interp_ssim
+                    + args.lambda_interp_envelope * loss_envelope)
             loss.backward()
             with torch.no_grad():
-                if iteration < args.densify_until_iter:
-                    visible = torch.stack([output['visibility_filter'] for output in outputs]).any(dim=0)
-                    gaussians.add_densification_stats_3d(visible)
+                if iteration < args.densify_until_iter and additive:
+                    gaussians.add_slice_statistics(real_outputs)
+                elif iteration < args.densify_until_iter:
+                    # radii>0 只表示候选范围；强度梯度非零才说明该点在本步实际参与了像素合成。
+                    candidate = torch.stack([output['visibility_filter'] for output in outputs]).any(dim=0)
+                    visible = candidate & (gaussians._intensity.grad[:, 0] != 0)
+                    radii = torch.stack([output['radii'] for output in outputs]).amax(dim=0)
+                    gaussians.add_densification_stats_3d(visible, radii)
             gaussians.optimizer.step()
             gaussians.optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
-                gaussians._scaling.clamp_(args.log_scale_min, args.log_scale_max)
+                # 尺度下界按 min_sigma_pixels 个面内像素换算，log_scale_min 仅作数值安全边界。
+                gaussians._scaling.clamp_(gaussians.log_scale_floor(), args.log_scale_max)
                 gaussians.prune_points(gaussians._invalid_point_mask())
                 if gaussians.get_xyz.shape[0] == 0:
                     raise FloatingPointError(f'{sample_name}: 优化后无有效高斯点')
-                if (args.densify_from_iter <= iteration < args.densify_until_iter
-                        and args.densification_interval > 0
-                        and iteration % args.densification_interval == 0):
-                    gaussians.structural_step(imgs, iteration, rendering, similarity)
+                if args.densification_interval > 0 and iteration % args.densification_interval == 0:
+                    if args.densify_from_iter <= iteration < args.densify_until_iter:
+                        structure_reports.append(structural_step(imgs, iteration, rendering, similarity))
+                    elif iteration >= args.densify_until_iter and args.structural_prune_after_densify:
+                        # 增殖窗口后的审计：剪除框外点、拆分尺寸超限点，不做误差驱动增殖。
+                        structure_reports.append(structural_step(
+                            imgs, iteration, rendering, similarity, densify=False))
             current = {'Total Loss': loss.item(), 'L1 Loss': loss_l1.item(),
                        'SSIM Loss': loss_ssim.item(), 'Aniso': loss_aniso.item(),
-                       'L1 interpo': loss_interp_l1.item(), 'ssim inter': loss_interp_ssim.item()}
+                       'L1 interpo': loss_interp_l1.item(), 'ssim inter': loss_interp_ssim.item(),
+                       'Envelope': loss_envelope.item()}
             history_iters.append(iteration)
             for name, value in current.items():
                 history_losses.setdefault(name, []).append(value)
@@ -282,11 +374,15 @@ def training(args):
                 pbar.set_postfix(loss=current['Total Loss'], points=gaussians.get_xyz.shape[0])
             if iteration % args.loss_plot_interval == 0 or iteration == args.iters:
                 update_loss_plot(case_dir, history_iters, history_losses, args.plot_dpi)
-            if (args.reconstruct_interval > 0 and iteration % args.reconstruct_interval == 0):
+            if iteration % args.structure_log_interval == 0 or iteration == args.iters:
+                append_structure_log(structure_log, iteration, gaussians.get_xyz.shape[0], structure_reports)
+                structure_reports = []
+            if (args.visualize and args.reconstruct_interval > 0
+                    and iteration % args.reconstruct_interval == 0):
                 reconstruct_full_case(
-                    gaussians, s, h, w, case_dir, iteration,
+                    gaussians, imgs, case_dir, iteration,
                     args.interpolation and iteration >= args.interpolate_iter,
-                    args.interp_step_size, **rendering)
+                    args.interp_step_size, args.plot_dpi, similarity, **rendering)
             if args.save_ply and iteration in args.save_iterations:
                 save_model_ply(gaussians,os.path.join(case_dir, f'point_cloud_iter_{iteration:06d}.ply'),iteration)
             if iteration % args.checkpoint_interval == 0 or iteration == args.iters:

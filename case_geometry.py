@@ -7,7 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
-from config_utils import render_options, RENDER_MODEL
+from config_utils import render_options, RENDER_MODEL, ADDITIVE_RENDER_MODEL, RENDER_SEMANTICS
+
+# 层面轮廓 FWHM 与高斯标准差之比 2·sqrt(2 ln 2)；与 diff_gaussian_rasterization_mri.FWHM_TO_SIGMA 相同，
+# 此处不导入 CUDA 扩展，使 CPU 几何检查不依赖编译库
+FWHM_TO_SIGMA = 1.0/(2.0*np.sqrt(2.0*np.log(2.0)))
 
 
 def make_geometry(spacing_xyz, shape_shw, args, legacy=False):
@@ -18,12 +22,23 @@ def make_geometry(spacing_xyz, shape_shw, args, legacy=False):
     bounds = list(args.bounds) if legacy else (extent/(2*scale)).tolist()
     rendering = render_options(args)
     rendering['bounds'] = bounds
+    model = getattr(args, 'render_model', RENDER_MODEL)
+    semantics = RENDER_SEMANTICS[model]
+    if model == ADDITIVE_RENDER_MODEL:
+        if legacy:
+            raise ValueError('加和切片模型需要 spacing 局部坐标，不支持旧 legacy_box 几何')
+        # 层厚 s（模型单位）：FWHM = k·sz，数据无层厚元数据，k 为实现选择；k=0 即零厚度截面
+        rendering['render_model'] = model
+        rendering['raster_options'].update(
+            slice_sigma=float(FWHM_TO_SIGMA*args.slice_thickness_fwhm_spacing*spacing[2]/scale),
+            amplitude_cutoff=float(args.amplitude_cutoff))
     return dict(version=0 if legacy else 1, frame='legacy_box' if legacy else 'spacing_stack_local',
                 spacing_unit='mm_assumed_from_dataset', spacing_xyz=spacing.tolist(),
                 shape_shw=[slices,height,width], scale_mm=None if legacy else scale,
                 bounds=bounds, reference_phase=args.reference_phase,
-                render_model=getattr(args, 'render_model', RENDER_MODEL),
-                intensity_semantics='local_value',
+                render_model=model,
+                intensity_semantics=semantics['intensity'], opacity_mode=semantics['opacity'],
+                rasterizer_api_version=semantics['api'],
                 normalization_epsilon=args.normalization_epsilon, rendering=rendering)
 
 
@@ -44,6 +59,8 @@ def check_geometry(saved, current):
 def attach_geometry(model, geometry):
     model.geometry = copy.deepcopy(geometry)
     model.bounds = list(geometry['bounds'])
+    # 强度参数化随渲染语义确定：加和模型的 _intensity 为 softplus 前的原始参数
+    model.intensity_softplus = geometry.get('intensity_semantics') == 'peak_density_softplus'
 
 
 def save_model_ply(model, path, iteration=None):

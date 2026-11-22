@@ -11,8 +11,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from Gaussians.GaussianModel_noop import GaussianModel
-from Gaussians.GaussianEvolution import GaussianEvolutionNetwork
+from Gaussians.GaussianModel_structural import GaussianModel
 from Dataloader import dataset
 from CostFunctions import l1_loss, ssim
 from Renderer import render
@@ -201,6 +200,11 @@ def prepare_cmr_sequence(cmr, cmr_layout='STHW', device='cuda'):
 
 
 def build_evolution_network(args):
+    """按需加载运动网络；占位文件不影响 Stage1 与评估模块导入。"""
+    try:
+        from Gaussians.GaussianEvolution import GaussianEvolutionNetwork
+    except ImportError as error:
+        raise RuntimeError('GaussianEvolution.py 尚未提供 GaussianEvolutionNetwork，无法运行 Stage2') from error
     return GaussianEvolutionNetwork(
         hidden_dim=args.evolution_hidden_dim,
         kinematics_depth=args.kinematics_depth,
@@ -484,8 +488,9 @@ def training(args):
         BaseGaussians = GaussianModel()
         tqdm.write(f"读取第一阶段高斯检查点: {stage1_ply_path}")
         record = read_model_geometry(stage1_ply_path)
-        geometry = record['geometry'] if record else make_geometry(
-            data['info']['spacing_xyz'][0],(num_slices,height,width),args,legacy=True)
+        if record is None:
+            raise ValueError('Stage1 PLY 缺少渲染语义及几何记录，不能自动解释为 alpha 模型')
+        geometry = record['geometry']
         check_geometry(geometry,make_geometry(data['info']['spacing_xyz'][0],
             (num_slices,height,width),args,legacy=geometry['version']==0))
         attach_geometry(BaseGaussians,geometry)

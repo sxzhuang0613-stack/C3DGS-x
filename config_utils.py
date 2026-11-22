@@ -7,7 +7,17 @@ from pathlib import Path
 import yaml
 
 
-RENDER_MODEL = "normalized_slice_v1"
+RENDER_MODEL = "innergs_alpha_fixed_v1"
+RASTERIZER_API_VERSION = 2
+# 加和层厚切片模型（diff_gaussian_rasterization_mri）：C = bg + Σ I·a·G，强度经 softplus 保证非负
+ADDITIVE_RENDER_MODEL = "additive_slab_v1"
+# 每种渲染模型的语义契约：库版本、强度/opacity 语义及配套的结构算法；geometry 与 checkpoint 按此核对
+RENDER_SEMANTICS = {
+    RENDER_MODEL: dict(api=RASTERIZER_API_VERSION, intensity='local_value', opacity='fixed_one',
+                       structure='batch_residual_v5'),
+    ADDITIVE_RENDER_MODEL: dict(api=1, intensity='peak_density_softplus', opacity='none',
+                                structure='additive_moment_v1'),
+}
 
 
 def load_config(path):
@@ -34,18 +44,37 @@ def load_config(path):
         raise ValueError('病例划分比例或参考相位非法')
     if len(values['bounds']) != 3 or any(value <= 0 for value in values['bounds']):
         raise ValueError('bounds 必须为三个正半边长')
+    if values['render_model'] not in RENDER_SEMANTICS:
+        raise ValueError(f'仅支持 {sorted(RENDER_SEMANTICS)} 渲染模型')
+    obsolete = set(values) & {'response_mode', 'psf_sigma', 'psf_std_vector',
+                              'kernel_cutoff', 'cutoff_transition', 'covariance_jitter'}
+    if obsolete:
+        raise ValueError(f'新库不支持这些旧渲染配置，请移除：{sorted(obsolete)}')
+    obsolete_structure = set(values) & {'max_num_pts', 'structural_growth_fraction',
+                                       'structural_split_fraction',
+                                       # 层间拉长设定已取消，初始尺度改为经典 3DGS kNN
+                                       'init_fine_sigma_pixels', 'init_coarse_sigma_pixels',
+                                       'init_coarse_fraction', 'init_normal_sigma_spacing',
+                                       'init_normal_floor_pixels', 'init_max_axis_ratio',
+                                       'lambda_normal_floor', 'normal_floor_kappa',
+                                       'lambda_interp_coverage', 'structural_prune_max_normal_spacing',
+                                       # 尺寸超限改为强制 Split，旧剪枝参数名不再使用
+                                       'structural_prune_from_iter', 'structural_prune_max_screen_radius',
+                                       'structural_prune_max_scale_ratio',
+                                       # 已取消按贡献删除，支撑门改用 structural_support_min_weight
+                                       'structural_prune_min_weight',
+                                       # Clone 已取消
+                                       'structural_clone_offset', 'structural_clone_jitter',
+                                       'structural_enable_clone'}
+    if obsolete_structure:
+        raise ValueError(f'已取消这些旧结构配置，请移除：{sorted(obsolete_structure)}')
     if 'iters' in values:
-        if values['render_model'] != RENDER_MODEL:
-            raise ValueError('Stage1 仅支持 normalized_slice_v1 渲染模型')
-        obsolete = set(values) & {'response_mode', 'psf_sigma', 'psf_std_vector',
-                                  'kernel_cutoff', 'cutoff_transition', 'covariance_jitter'}
-        if obsolete:
-            raise ValueError(f'新库不支持这些旧渲染配置，请移除：{sorted(obsolete)}')
         for key in ('iters', 'checkpoint_interval', 'loss_plot_interval', 'status_interval',
+                    'structure_log_interval',
                     'real_slices_per_iter', 'num_pts', 'interp_step_size',
                     'stage2_iters', 'stage2_save_interval', 'stage2_loss_plot_interval',
-                    'init_edge_sigma', 'init_edge_truncate', 'init_fine_sigma_pixels', 'init_coarse_sigma_pixels',
-                    'init_normal_sigma_spacing', 'init_normal_floor_pixels', 'init_ridge_relative'):
+                    'init_edge_sigma', 'init_edge_truncate', 'init_ridge_relative',
+                    'min_sigma_pixels'):
             if values[key] <= 0:
                 raise ValueError(f'{key} 必须大于零')
         if not (0 <= values['init_uniform_fraction'] <= 1
@@ -54,34 +83,60 @@ def load_config(path):
         quantiles = values['init_sampling_quantiles']
         if len(quantiles) != 2 or not 0 <= quantiles[0] < quantiles[1] <= 1:
             raise ValueError('初始化采样分位数必须为 [low,high]，满足 0 <= low < high <= 1')
-        for key in ('init_foreground_threshold','init_edge_quantile','init_coarse_fraction'):
+        for key in ('init_foreground_threshold','init_edge_quantile'):
             if not 0 <= values[key] <= 1:
                 raise ValueError(f'{key} 必须位于 [0,1]')
         for key in ('init_foreground_dilation','init_fit_steps','init_support_retries'):
             if not isinstance(values[key],int) or values[key] < 0:
                 raise ValueError(f'{key} 必须为非负整数')
         if not (0 <= values['init_grid_jitter'] < .5 and 0 < values['init_normal_jitter'] <= .5
-                and 0 < values['init_cg_rtol'] < 1 and values['init_max_axis_ratio'] >= 1):
-            raise ValueError('初始化抖动、CG 容差或轴比配置非法')
-        if not 1 <= values['structural_min_points'] <= values['num_pts'] <= values['max_num_pts']:
-            raise ValueError('结构容量需要 1 <= min_points <= num_pts <= max_num_pts')
-        if not 0 < values['structural_split_fraction'] < 1:
-            raise ValueError('structural_split_fraction 必须在 (0,1) 内')
-        if values['structural_algorithm'] != 'batch_normalized_v1':
-            raise ValueError('当前 Stage1 仅支持 structural_algorithm=batch_normalized_v1')
+                and 0 < values['init_cg_rtol'] < 1):
+            raise ValueError('初始化抖动或 CG 容差配置非法')
+        if not 1 <= values['structural_min_points'] <= values['num_pts']:
+            raise ValueError('初始点数需要 1 <= structural_min_points <= num_pts')
+        expected = RENDER_SEMANTICS[values['render_model']]['structure']
+        if values['structural_algorithm'] != expected:
+            raise ValueError(f"{values['render_model']} 渲染模型需要 structural_algorithm={expected}")
+        if values['render_model'] == ADDITIVE_RENDER_MODEL:
+            for key in ('slice_thickness_fwhm_spacing', 'structural_normal_grad_multiplier',
+                        'structural_prune_intensity', 'structural_size_max_sigma_pixels'):
+                if not isinstance(values[key], (int, float)) or not math.isfinite(values[key]) or values[key] < 0:
+                    raise ValueError(f'{key} 必须为有限非负数')
+            for key in ('structural_split_ratio', 'structural_size_split_ratio'):
+                if not 0 < values[key] < 1:
+                    raise ValueError(f'{key} 必须位于 (0,1)')
+            for key in ('amplitude_cutoff', 'structural_observe_amplitude'):
+                if not 0 < values[key] < 1:
+                    raise ValueError(f'{key} 必须位于 (0,1)')
+            if not 0 <= values['structural_normal_conflict'] < 1:
+                raise ValueError('structural_normal_conflict 必须位于 [0,1)')
+            if not isinstance(values['init_nonneg_steps'], int) or values['init_nonneg_steps'] < 0:
+                raise ValueError('init_nonneg_steps 必须为非负整数')
         if values['structural_prune_peak'] != 0:
-            raise ValueError('归一化平均不能按低强度剪枝，structural_prune_peak 必须为 0')
+            raise ValueError('固定 opacity 不支持按颜色强度剪枝，structural_prune_peak 必须为 0')
         for key in ('structural_grad_threshold', 'structural_grad_multiplier',
-                    'structural_clone_jitter', 'structural_prune_peak'):
+                    'structural_prune_peak',
+                    'structural_size_max_screen_radius', 'structural_size_max_scale_ratio',
+                    'structural_residual_threshold', 'structural_support_min_weight',
+                    'lambda_interp_envelope'):
             if not isinstance(values[key], (int, float)) or not math.isfinite(values[key]) or values[key] < 0:
                 raise ValueError(f'{key} 必须为有限非负数')
         if not (isinstance(values['structural_min_observations'], int)
                 and values['structural_min_observations'] > 0):
             raise ValueError('structural_min_observations 必须为正整数')
+        for key in ('structural_enable_split',
+                    'structural_inplane_gradient', 'structural_residual_gate'):
+            if not isinstance(values[key], bool):
+                raise ValueError(f'{key} 必须为布尔值')
+        if not isinstance(values['visualize'], bool):
+            raise ValueError('visualize 必须为布尔值')
+        if not isinstance(values['structural_prune_after_densify'], bool):
+            raise ValueError('structural_prune_after_densify 必须为布尔值')
         if not math.isfinite(values['structural_split_sigma_pixels']) or values['structural_split_sigma_pixels'] <= 0:
             raise ValueError('structural_split_sigma_pixels 必须为有限正数')
-        if not 0 <= values['structural_growth_fraction'] <= 1:
-            raise ValueError('structural_growth_fraction 必须位于 [0,1]')
+        if (not isinstance(values['structural_size_split_from_iter'], int)
+                or values['structural_size_split_from_iter'] < 0):
+            raise ValueError('structural_size_split_from_iter 必须为非负整数')
         if (values['lambda_l1'] < 0 or values['lambda_ssim'] < 0
                 or values['lambda_l1']+values['lambda_ssim'] <= 0):
             raise ValueError('训练需要非负且不全为零的 L1/SSIM 权重')

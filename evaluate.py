@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from config_utils import load_config, setup_runtime, dataset_options, ssim_options
 from CostFunctions import l1_loss, ssim
 from Dataloader import dataset
-from Gaussians.GaussianModel_noop import GaussianModel
+from Gaussians.GaussianModel_structural import GaussianModel
 from Renderer import render
 from case_geometry import make_geometry, check_geometry, attach_geometry, read_model_geometry
 
@@ -35,12 +35,11 @@ def evaluate(args):
         model = GaussianModel()
         ply_path = args.stage1_ply_path.format(case=case)
         record = read_model_geometry(ply_path)
-        geometry = record['geometry'] if record else make_geometry(
-            data['info']['spacing_xyz'][0],images.shape,args,legacy=True)
+        if record is None:
+            raise ValueError('PLY 缺少渲染语义及几何记录，不能自动解释为固定 opacity 的 alpha 模型')
+        geometry = record['geometry']
         check_geometry(geometry,make_geometry(data['info']['spacing_xyz'][0],images.shape,args,
                                              legacy=geometry['version']==0))
-        if record is None:
-            tqdm.write(f'[{case}] 无几何记录的旧 PLY：使用配置中的 legacy_box。')
         attach_geometry(model,geometry)
         rendering = geometry['rendering']
         model.load_ply(ply_path,

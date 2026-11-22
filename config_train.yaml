@@ -1,6 +1,6 @@
 # 训练配置：两个阶段与可选预处理
 # 相对路径以本文件为基准；cuda:0 尊重外部 CUDA_VISIBLE_DEVICES。
-# 保留原实验的损失权重和 12500 步插层起点；max_num_pts 是新增容量上限。
+# 保留原实验的损失权重和 12500 步插层起点。
 
 # 运行设备与随机性
 device: "cuda:0"
@@ -8,7 +8,7 @@ random_seed: 8439453
 
 # 数据来源、病例划分与参考相位
 dataset_name: "acdc"
-dataset_paths: {"acdc": "/home/exouser/Datasets/ACDC/database/dataset_npz", 
+dataset_paths: {"acdc": "/home/exouser/datasets/ACDC/database_npz", 
                 "mnms": "/home/exouser/Datasets/MnMs/MnM/data_npz",
                 }
 dataset_mode: "all"
@@ -18,14 +18,20 @@ num_workers: 0
 pin_memory: true
 reference_phase: 0
 
-# 仅作为无几何记录旧模型的坐标；新模型的 bounds 从 spacing 自动生成
+# legacy_box 坐标边界；所有加载模型仍须提供匹配的渲染和几何记录
 bounds: [1.0, 1.0, 1.0]
 legacy_color_policy: "strict"
 
-# 归一化切片：库固定使用轴向点采样与裁剪，不支持旧 PSF/软 cutoff 选项。
-render_model: "normalized_slice_v1"
+# 渲染模型："innergs_alpha_fixed_v1"（旧：固定 opacity=1 的 alpha 合成，零厚度点采样）或
+# "additive_slab_v1"（diff_gaussian_rasterization_mri：沿法向层厚积分 + 信号线性加和，强度 softplus 非负）
+render_model: "additive_slab_v1"
 background: 0.0
 raster_debug: false
+# [additive] 层面轮廓 FWHM，以层间距 sz 为单位；1.0 即相邻层恰好相接，0 为零厚度截面。
+# 数据未提供层厚，此值为实现选择而非采集参数
+slice_thickness_fwhm_spacing: 1.0
+# [additive] 截断：几何幅值 a·G 低于该值的像素项不累加（与强度无关，暗点仍有梯度）
+amplitude_cutoff: 0.00392156862745098
 
 # 训练/测试共用的 SSIM 定义，data_range 为归一化强度范围
 ssim_window_size: 5
@@ -35,9 +41,11 @@ ssim_k2: 0.03
 data_range: 1.0
 
 # 输出与模型路径
-output_path: "/home/exouser/Outputs/C3DGS/acdc_experiment_normalized"
-stage1_model_root: "/home/exouser/Outputs/C3DGS/acdc_experiment"
-stage2_output_path: "/home/exouser/Outputs/C3DGS/acdc_experiment/stage2_experiments"
+# 每例输出 <output_path>/<case>/：training_state.pth、PLY 及几何记录、loss_curves.png（每 loss_plot_interval 覆盖）、
+# reconstructions/iter_XXXXXX.png（每 reconstruct_interval 一张全切片拼图）。旧实验结果保留在 /home/exouser/Outputs/C3DGS
+output_path: "/home/exouser/codes/OutPut/C3DGS"
+stage1_model_root: "/home/exouser/codes/OutPut/C3DGS"
+stage2_output_path: "/home/exouser/codes/OutPut/C3DGS/stage2_experiments"
 
 # Stage1 训练、恢复与保存
 iters: 20000
@@ -48,14 +56,17 @@ checkpoint_interval: 1000
 save_ply: true
 save_iterations: [10000, 20000]
 loss_plot_interval: 1000
+# 每隔该步数把窗口内各结构周期的 split/剪枝/放行数与门限汇总写入 <case>/structure_log.csv
+structure_log_interval: 500
+# 是否每 reconstruct_interval 步保存"原图 | 渲染"并排拼图（含逐层 PSNR/SSIM）
+visualize: true
 reconstruct_interval: 2000
 interp_step_size: 0.25
 status_interval: 10
 plot_dpi: 150
 
-# Stage1 初始化与增殖容量上限
-num_pts: 50000
-max_num_pts: 200000
+# Stage1 初始化点数（经典 kNN 尺度随点数自适应）；后续只通过 Split 增加，不设点数上限或每周期增长预算
+num_pts: 1000
 init_uniform_fraction: 0.5
 init_foreground_fraction: 0.3
 # 边缘比例为 1-uniform-foreground
@@ -67,21 +78,19 @@ init_edge_truncate: 3.0
 init_edge_quantile: 0.8
 init_grid_jitter: 0.35
 init_normal_jitter: 0.45
-init_coarse_fraction: 0.2
-init_fine_sigma_pixels: 1.25
-init_coarse_sigma_pixels: 2.5
-init_normal_sigma_spacing: 0.4
-init_normal_floor_pixels: 0.5
-init_max_axis_ratio: 5.0
+# 初始尺度按经典 3DGS：各向同性 sigma=sqrt(到最近 3 个中心平方距离的均值)，下界为 min_sigma_pixels
 init_support_retries: 3
 init_fit_steps: 20
 init_cg_rtol: 0.001
 init_ridge_relative: 0.0001
+# [additive] CG 解截到非负后的非负最小二乘乘性更新步数（每步一次前向+伴随）
+init_nonneg_steps: 20
 
 # Stage1 优化器与位置学习率
 position_lr_init: 0.00016
 position_lr_final: 1.6e-05
-position_lr_max_steps: 30000
+# 与 iters 一致，训练结束时位置学习率恰好衰减到 position_lr_final
+position_lr_max_steps: 20000
 # 兼容现有位置调度器；其 delay_steps 默认 0，学习率曲线保持不变
 position_lr_delay_mult: 0.01
 intensity_lr: 0.0025
@@ -89,13 +98,17 @@ scaling_lr: 0.005
 rotation_lr: 0.001
 adam_eps: 1.0e-15
 adam_betas: [0.9, 0.999]
+# 模型坐标下的数值安全边界；实际尺度下界由 min_sigma_pixels 按病例面内像素换算
 log_scale_min: -10.0
 log_scale_max: 10.0
+# 任一局部轴标准差不小于该面内像素数；像素中心采样、无抗锯齿时更细的核退化为脉冲
+min_sigma_pixels: 0.5
 
 # 真实切片采样及空间插层监督
 real_slices_per_iter: 2
 interpolation: true
-interpolate_iter: 12500
+# 早于 densify_until_iter，使插层误差也能驱动结构调整
+interpolate_iter: 5000
 interpolation_probability: 0.5
 interpolation_alpha_min: 0.2
 interpolation_alpha_max: 0.8
@@ -104,32 +117,70 @@ interpolation_alpha_max: 0.8
 lambda_l1: 2.0
 lambda_ssim: 0.25
 lambda_anisotropic: 0.1
+# 插层分支未命中时额外采样一张真实切片的 L1/SSIM 权重
 lambda_interp_l1: 1.0
 lambda_interp_ssim: 0.1
+# 插层：强度落在相邻两层之间的区间约束（替代像素级线性混合，避免双重轮廓）
+lambda_interp_envelope: 1.0
 anisotropic_max_ratio: 6.0
 anisotropic_epsilon: 1.0e-06
 
-# 结构操作调度，保留原调用起止点及间隔
+# 结构操作调度：[densify_from_iter, densify_until_iter) 内每 densification_interval 步一次，最后一次在 9800 步；
+# 此后高斯数目定型，剩余步数只优化参数（与经典 3DGS 增殖窗口后不再增删一致）
 densify_from_iter: 1000
-densify_until_iter: 12500
+densify_until_iter: 10000
 densification_interval: 200
 
-# 批量结构调整：阈值掩码 + Clone/Split/Prune，不进行局部拟合和目标验收
-structural_algorithm: "batch_normalized_v1"
+# 批量结构调整：残差门控 Split + 尺寸超限强制 Split + 观测框/无效点剪枝；不做 Clone，不按贡献质量删除
+# 须与 render_model 配套：alpha → batch_residual_v5；additive → additive_moment_v1
+structural_algorithm: "additive_moment_v1"
 structural_min_points: 1
-# g_voxel 为按 XYZ 体素长度换算的平均位置梯度；实际门限取两者最大值
+# g_voxel 为按 XYZ 体素长度换算的平均位置梯度；首个周期以 multiplier*正梯度中位数标定后冻结，
+# 实际门限取 max(grad_threshold, 冻结值)，不再每周期按相对中位数选出固定比例
 structural_grad_threshold: 0.0
 structural_grad_multiplier: 2.0
 structural_min_observations: 8
-# 面内投影最大标准差，单位为输出像素；大点 Split，小点 Clone
-structural_split_sigma_pixels: 2.0
-structural_split_fraction: 0.35
-# 仅扰动 Clone 新点，以父点局部标准差为单位；父点和局部强度保持不变
-structural_clone_jitter: 0.05
-# 每周期净增点数不超过存活点数的 5%，并受 max_num_pts 限制
-structural_growth_fraction: 0.05
-# 归一化颜色不是幅度或 opacity；必须为 0，仅裁剪无效点
+# 覆盖区平均残差 sum(T*alpha*|r|)/sum(T*alpha) 的绝对门限（归一化强度），即可接受误差；越小最终点数越多。
+# ACDC 残差下限约 0.001-0.002（噪声 E|r|≈0.8σ、uint8 量化 step/4，收敛时 E/W 中位数实测 0.0017-0.002），取约 3 倍
+structural_residual_threshold: 0.005
+# 增殖支撑门：真实层贡献质量 sum(T*alpha) 不低于该像素当量才可 Split（避免 E/W 小数相除的噪声）；
+# 只门控增殖，不删除低贡献点（层间点可能服务插层渲染）
+structural_support_min_weight: 0.5
+# 增殖窗口结束后是否继续审计（剪除框外点、拆分尺寸超限点）；false 表示 densify_until_iter 后不再改变高斯数目
+structural_prune_after_densify: false
+# 面内投影最大标准差，单位为输出像素；超过该值且通过梯度/残差门的点 Split（不做 Clone）。
+# 核需放进最薄组织带：FWHM=2.355σ <= 心肌厚度。ACDC 约 1 mm/px，心肌厚度 p10/中位数 5.6/7.5 mm -> σ 2.4/3.2 px
+structural_split_sigma_pixels: 2.5
+# 增殖统计只用面内 (x,y) 位置梯度（对应经典 3DGS 屏幕空间梯度）；false 时用含 z 的三维体素梯度
+structural_inplane_gradient: false
+# 是否启用贡献审计与残差门（E/W > tau、W 支撑门）；false 即经典 3DGS 模式，结构周期无额外渲染
+structural_residual_gate: true
+# 消融开关：是否启用 Split（包含误差驱动与尺寸超限强制拆分）；Clone 已取消
+structural_enable_split: true
+# 尺寸超限强制 Split（不删除、不受梯度/残差门控，增殖窗口后也执行）：从第 3000 步起，
+# 本周期最大候选半径超过 20 像素，或面内投影标准差超过 0.1*max(bounds) 的点拆成两个 1/1.6 尺度的子点；
+# 子点仍超限则下个周期继续拆。不限制沿法向的拉长。单项阈值为 0 时关闭该项
+structural_size_split_from_iter: 3000
+structural_size_max_screen_radius: 20.0
+structural_size_max_scale_ratio: 0.1
+# 保留暗色点，不按颜色强度剪枝
 structural_prune_peak: 0.0
+# ---- [additive_moment_v1] 加和模型结构操作；上面的残差门/支撑门/inplane_gradient/size_max_scale_ratio 仅旧算法使用 ----
+# D1 面内、D2 法向分裂沿主轴矩匹配（保持总信号/质心/协方差）：σ_j→rσ_j，中心 ±σ_j√(1-r²)，I→I/(2r)。
+# r=0.8 时分裂瞬间场的相对 L2 变化约 4.5%
+structural_split_ratio: 0.8
+# D3 尺寸强制分裂同样矩匹配，但对半缩小最长面内轴（r=0.5，I 不变）以尽快降到上限以下
+structural_size_split_ratio: 0.5
+# D3 面内投影标准差上限（像素）；与 structural_size_max_screen_radius 任一超限即强制分裂
+structural_size_max_sigma_pixels: 4.0
+# D2 法向门限 = 倍数 × 首周期「≥2 层观测点」平均 |n·∂L/∂μ| 的中位数，随后冻结
+structural_normal_grad_multiplier: 2.0
+# D2 冲突比 1-|Σ_t H_t|/Σ_t|H_t| 门限：0.5 即上下层把中心往相反方向拉且大小相当
+structural_normal_conflict: 0.5
+# 统计与 D2 子代可观测判据：本层几何幅值 a ≥ 该值才算「落在该层上」
+structural_observe_amplitude: 0.1
+# P1 解析不可见剪枝：I·sqrt(cc/(cc+s²)) < ε 时在任意层位都低于量化精度（归一化强度 1/255）
+structural_prune_intensity: 0.00392156862745098
 
 # Stage2 网络与控制点参数（不改变 motion 算法）
 evolution_hidden_dim: 128
