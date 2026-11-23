@@ -93,7 +93,7 @@ def reference_render(model, img_size, slice_idx, axis, num_slices, **kwargs):
 
 def alpha_train_config():
     """config_train.yaml 的旧 alpha 版本：旧模型契约测试不随主配置切换到加和模型而改变。"""
-    from config_utils import load_config
+    from utils.config_utils import load_config
     args = load_config(ROOT/'config_train.yaml')
     args.render_model = 'innergs_alpha_fixed_v1'
     args.structural_algorithm = 'batch_residual_v5'

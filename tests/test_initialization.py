@@ -14,9 +14,9 @@ if not all(importlib.util.find_spec(name) for name in ('torch','numpy','yaml','p
     raise unittest.SkipTest('需要已有 PyTorch/NumPy/PyYAML/plyfile')
 import numpy as np
 import torch
-from config_utils import load_config, ssim_options
-from case_geometry import make_geometry, check_geometry, attach_geometry, save_model_ply, read_model_geometry
-from CostFunctions import anisotropic_scale_loss
+from utils.config_utils import load_config, ssim_options
+from utils.case_geometry import make_geometry, check_geometry, attach_geometry, save_model_ply, read_model_geometry
+from utils.CostFunctions import anisotropic_scale_loss
 from Gaussians.GaussianModel_structural import GaussianModel
 from Gaussians.initialization import IntensityOperator
 from stage1_test_support import NATIVE_AVAILABLE, reference_render, alpha_train_config
@@ -228,7 +228,7 @@ class CudaInitializationTests(unittest.TestCase):
         pixels = torch.linspace(-.2,.4,images.numel(),device='cuda',dtype=torch.float64).reshape_as(images)
         torch.testing.assert_close((operator.forward(vector)*pixels).mean(),vector@operator.adjoint(pixels),rtol=5e-5,atol=1e-7)
         model.training_setup(self.args)
-        from Renderer import render
+        from utils.Renderer import render
         prediction = render(model,[9,13],1,2,3,**model.geometry['rendering'])['render']
         (prediction-images[1]).square().mean().backward()
         for group in model.optimizer.param_groups:

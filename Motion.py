@@ -13,10 +13,10 @@ import matplotlib.pyplot as plt
 
 from Gaussians.GaussianModel_structural import GaussianModel
 from Dataloader import dataset
-from CostFunctions import l1_loss, ssim
-from Renderer import render
-from config_utils import load_config, setup_runtime, dataset_options, ssim_options
-from case_geometry import make_geometry, check_geometry, attach_geometry, read_model_geometry
+from utils.CostFunctions import l1_loss, ssim
+from utils.Renderer import render
+from utils.config_utils import load_config, setup_runtime, dataset_options, ssim_options
+from utils.case_geometry import make_geometry, check_geometry, attach_geometry, read_model_geometry
 
 
 MOTION_CODE_VERSION = "20260917_control_graph_slice_training_modes_v9"

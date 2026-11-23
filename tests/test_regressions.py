@@ -29,7 +29,7 @@ def source_function(filename, name, namespace, class_name=None):
 @unittest.skipUnless(importlib.util.find_spec('yaml'), '需要 PyYAML')
 class ConfigTests(unittest.TestCase):
     def test_configs_have_numeric_optimizer_and_renderer_values(self):
-        from config_utils import load_config
+        from utils.config_utils import load_config
         args = load_config(ROOT / 'config_train.yaml')
         for key in ('adam_eps', 'stage2_adam_eps', 'init_ridge_relative'):
             self.assertIsInstance(getattr(args, key), float)
@@ -39,14 +39,14 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(hasattr(args, 'structural_growth_fraction'))
 
     def test_test_config_only_contains_stage1_parameters(self):
-        from config_utils import load_config
+        from utils.config_utils import load_config
         args = load_config(ROOT / 'config_test.yaml')
         self.assertFalse(any(key.startswith('stage2') for key in vars(args)))
         self.assertFalse(hasattr(args, 'iters'))
         self.assertIn('{case}', args.stage1_ply_path)
 
     def test_duplicate_keys_are_rejected(self):
-        from config_utils import load_config
+        from utils.config_utils import load_config
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'config.yaml'
             path.write_text('device: cuda:0\ndevice: cuda:1\n')
@@ -56,7 +56,7 @@ class ConfigTests(unittest.TestCase):
     def test_old_structure_options_are_rejected(self):
         """已取消的容量、增长预算和旧 Split 参数不能以静默配置残留。"""
         import yaml
-        from config_utils import load_config
+        from utils.config_utils import load_config
         original = yaml.safe_load((ROOT/'config_train.yaml').read_text())
         for key, value in (('max_num_pts', 200000), ('structural_growth_fraction', .05),
                            ('structural_split_fraction', .35),
@@ -69,7 +69,7 @@ class ConfigTests(unittest.TestCase):
     def test_pruning_thresholds_are_validated(self):
         """过大尺寸参数必须有限非负，启用步数必须为非负整数。"""
         import yaml
-        from config_utils import load_config
+        from utils.config_utils import load_config
         original = yaml.safe_load((ROOT/'config_train.yaml').read_text())
         for key, value in (('structural_size_max_screen_radius', -1.),
                            ('structural_size_max_scale_ratio', float('nan')),
@@ -80,12 +80,12 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ValueError):load_config(path)
 
     def test_config_paths_do_not_depend_on_cwd(self):
-        from config_utils import load_config
+        from utils.config_utils import load_config
         args = load_config(ROOT / 'config_test.yaml')
         self.assertEqual(Path(args.output_path), ROOT / 'output/evaluation')
 
     def test_active_entry_fields_are_all_configured(self):
-        from config_utils import load_config
+        from utils.config_utils import load_config
         for config, files in (
             ('config_train.yaml', ['GetInitialGaussian.py', 'Motion.py', 'temp.py',
                                    'config_utils.py',
@@ -136,9 +136,9 @@ HAS_TENSORS = all(importlib.util.find_spec(name) is not None for name in ('torch
 class TensorTests(unittest.TestCase):
     def model(self, scale=0.1, count=4):
         import torch
-        from config_utils import load_config
+        from utils.config_utils import load_config
         from Gaussians.GaussianModel_structural import GaussianModel
-        from case_geometry import make_geometry, attach_geometry
+        from utils.case_geometry import make_geometry, attach_geometry
         from stage1_test_support import alpha_train_config
         args = alpha_train_config()
         args.device = 'cpu'
@@ -206,7 +206,7 @@ class TensorTests(unittest.TestCase):
 
     def test_ssim_identity(self):
         import torch
-        from CostFunctions import ssim
+        from utils.CostFunctions import ssim
         image = torch.rand(2, 1, 16, 16)
         self.assertAlmostEqual(ssim(image, image).item(), 1., places=6)
 
@@ -214,7 +214,7 @@ class TensorTests(unittest.TestCase):
         """当前 Renderer 的预计算协方差能向实际切片几何反传梯度。"""
         import torch
         from stage1_test_support import NATIVE_AVAILABLE
-        from Renderer import render
+        from utils.Renderer import render
         if not torch.cuda.is_available() or not NATIVE_AVAILABLE:
             self.skipTest('需要 CUDA 与 API_VERSION=2 的切片扩展')
         model,_=self.model(count=1)

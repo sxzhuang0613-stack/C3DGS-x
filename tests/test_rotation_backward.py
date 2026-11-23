@@ -11,8 +11,8 @@ if importlib.util.find_spec('torch') is None:
 import torch
 import diff_gaussian_slice_rendering as package
 from Gaussians.GaussianModel_structural import GaussianModel
-from Renderer import render
-from config_utils import load_config,render_options
+from utils.Renderer import render
+from utils.config_utils import load_config,render_options
 
 
 @unittest.skipUnless(torch.cuda.is_available() and package._C is not None,'需要 CUDA 与已安装渲染扩展')

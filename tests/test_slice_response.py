@@ -249,8 +249,8 @@ class CudaTests(unittest.TestCase):
 
     @unittest.skipUnless(importlib.util.find_spec('yaml'), '需要 PyYAML 读取训练/测试配置')
     def test_train_and_test_render_configuration(self):
-        from config_utils import load_config,render_options
-        from Renderer import render
+        from utils.config_utils import load_config,render_options
+        from utils.Renderer import render
         means,scales,rotation,intensity=scene(torch.float32,'cuda')
         model=types.SimpleNamespace(get_xyz=means,get_color=intensity,get_scaling=scales,get_rotation=rotation)
         for filename in ('config_train.yaml','config_test.yaml'):
@@ -262,7 +262,7 @@ class CudaTests(unittest.TestCase):
                 self.assertTrue(all(torch.isfinite(value).all() for value in gradients))
 
     def test_settings_snapshot_and_training_wrapper(self):
-        from Renderer import render
+        from utils.Renderer import render
         means,scales,rotation,intensity=scene(torch.float32,'cuda')
         model=types.SimpleNamespace(get_xyz=means,get_color=intensity,get_scaling=scales,get_rotation=rotation)
         for covariance in (None,covariance_from_scales(scales,rotation)):

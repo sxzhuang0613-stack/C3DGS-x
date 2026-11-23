@@ -61,7 +61,7 @@ class dataset(Dataset):
         self.label_map = torch.tensor(label_maps[datasets], dtype=torch.long)
         self.normalization_epsilon = normalization_epsilon
         if data_path is None:
-            from config_utils import load_config
+            from utils.config_utils import load_config
             config = config or load_config('config_train.yaml')
             data_path = config.dataset_paths[datasets]
         self.data_pth = data_path
@@ -234,7 +234,7 @@ def fix_len(arr):
 
 if __name__ == '__main__':
     # 测试loader调用和循环
-    from config_utils import load_config
+    from utils.config_utils import load_config
     config = load_config('config_train.yaml')
     loader = torch.utils.data.DataLoader(dataset())
 

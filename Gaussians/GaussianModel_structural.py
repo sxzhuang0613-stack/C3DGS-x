@@ -180,7 +180,7 @@ class GaussianModel:
         渲染对颜色线性，dI/dc_i=T_i*alpha_i 与颜色取值无关，两次颜色反向即得 W、E；
         二者与颜色无关，按 W 剪枝不会误删暗色组织。单位为像素当量。
         """
-        from Renderer import render
+        from utils.Renderer import render
         from .utils import covariance_from_scaling_rotation
         slices, height, width = images.shape
         xyz = self._xyz.detach()

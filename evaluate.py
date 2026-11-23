@@ -10,12 +10,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from config_utils import load_config, setup_runtime, dataset_options, ssim_options
-from CostFunctions import l1_loss, ssim
+from utils.config_utils import load_config, setup_runtime, dataset_options, ssim_options
+from utils.CostFunctions import l1_loss, ssim
 from Dataloader import dataset
 from Gaussians.GaussianModel_structural import GaussianModel
-from Renderer import render
-from case_geometry import make_geometry, check_geometry, attach_geometry, read_model_geometry
+from utils.Renderer import render
+from utils.case_geometry import make_geometry, check_geometry, attach_geometry, read_model_geometry
 
 
 def evaluate(args):

@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from Renderer import render
+from utils.Renderer import render
 from .utils import covariance_from_scaling_rotation
 
 

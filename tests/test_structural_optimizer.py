@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import torch
 from torch import nn
-from config_utils import load_config
-from case_geometry import make_geometry, attach_geometry
+from utils.config_utils import load_config
+from utils.case_geometry import make_geometry, attach_geometry
 from Gaussians.GaussianModel_structural import GaussianModel
 from stage1_test_support import NATIVE_AVAILABLE, alpha_train_config
 
@@ -409,7 +409,7 @@ class StructuralTests(unittest.TestCase):
 
     def test_short_cuda_render_update_structure_update(self):
         if not torch.cuda.is_available() or not NATIVE_AVAILABLE:self.skipTest('需要 CUDA 与新库')
-        from Renderer import render
+        from utils.Renderer import render
         model = self.model(scales=(.3, .1, .2), device='cuda')
         for iteration in range(4):
             output = render(model, [17, 19], 1, 2, 3, **model.geometry['rendering'])

@@ -12,9 +12,9 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
-from Renderer import render, covariance_to_vector
-from config_utils import load_config
-from case_geometry import make_geometry, attach_geometry, check_geometry
+from utils.Renderer import render, covariance_to_vector
+from utils.config_utils import load_config
+from utils.case_geometry import make_geometry, attach_geometry, check_geometry
 from Gaussians.GaussianModel_structural import GaussianModel
 from Gaussians.initialization import initialize_from_images
 from Gaussians.utils import covariance_from_scaling_rotation

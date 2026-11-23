@@ -4,13 +4,13 @@ import torch
 from Gaussians.GaussianModel_structural import GaussianModel
 from Gaussians.utils import covariance_from_scaling_rotation
 from Dataloader import dataset
-from CostFunctions import l1_loss, ssim, anisotropic_scale_loss, envelope_loss
-from Renderer import render
+from utils.CostFunctions import l1_loss, ssim, anisotropic_scale_loss, envelope_loss
+from utils.Renderer import render
 import argparse
 import random
 import numpy as np
-from config_utils import load_config, setup_runtime, dataset_options, ssim_options, RENDER_SEMANTICS
-from case_geometry import make_geometry, check_geometry, attach_geometry, save_model_ply, read_model_geometry
+from utils.config_utils import load_config, setup_runtime, dataset_options, ssim_options, RENDER_SEMANTICS
+from utils.case_geometry import make_geometry, check_geometry, attach_geometry, save_model_ply, read_model_geometry
 from tqdm import tqdm
 
 import matplotlib
