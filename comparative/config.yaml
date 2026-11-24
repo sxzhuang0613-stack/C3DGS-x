@@ -1,0 +1,75 @@
+# 对比实验统一配置：training.py 与 evaluation.py 共用
+# 相对路径以本文件为基准；cuda:0 尊重外部 CUDA_VISIBLE_DEVICES。
+# 所有方法均按病例独立拟合参考相位的静态体（Dyna3DGR full 另拟合完整序列），不代表跨病例泛化。
+
+# 运行设备与随机性（每个病例开始前按该种子重置）
+device: "cuda:0"
+random_seed: 42
+
+# 数据来源与病例划分：与 C3DGS 共用 Dataloader.dataset(dim='3D')，评估集合沿用 evaluate.py 的有效标签过滤
+dataset_name: "acdc"
+dataset_paths: {"acdc": "/home/exouser/datasets/ACDC/database_npz",
+                "mnms": "/home/exouser/Datasets/MnMs/MnM/data_npz"}
+dataset_mode: "val"
+train_fraction: 0.7
+normalization_epsilon: 0.0001
+# 只跑指定病例（NPZ 文件主名，如 patient001）；空列表表示集合内全部病例
+cases: []
+# 静态方法拟合的相位；Dyna3DGR stage1 按约定固定使用初始帧 t=0
+reference_phase: 0
+
+# 测试协议：observed 在全部观测层上训练与评估（拟合度）；
+# holdout 只用 k % holdout_stride == 0 的层训练，在两端训练层之间的留出层上评估（层间重建），外推层不计入指标
+eval_protocol: "observed"
+holdout_stride: 2
+
+# 逐病例迭代方法统一的迭代数（GaussianSVR max_iter、GSVR max_epochs、NeSVoR n_iter、
+# ECLARE 训练步数、Dyna3DGR stage1）；各方法内部按绝对步数写死的里程碑按原比例缩放
+iters: 20000
+
+# 层面轮廓：FWHM = slice_thickness_fwhm_spacing × sz（与 C3DGS 相同；数据无层厚元数据，此值为实现选择）
+slice_thickness_fwhm_spacing: 1.0
+# 插层输出步长（以层间距为单位），1/interp_step_size 须为整数，使整数层位落在输出网格上
+interp_step_size: 0.25
+
+# 参考代码与输出；输出结构 <output_root>/<eval_protocol>/<method>/<case>/
+references_root: "/home/exouser/codes/References"
+output_root: "/home/exouser/codes/OutPut/comparative"
+skip_existing: true
+
+# 评估：指标定义与 config_test.yaml 相同（逐层 L1 / PSNR / SSIM）
+ssim_window_size: 5
+ssim_sigma: 1.5
+ssim_k1: 0.01
+ssim_k2: 0.03
+data_range: 1.0
+clamp_predictions: false
+save_images: true
+
+# ---- 各方法设置：未列出的超参数保持各方法预设；运动校正统一关闭，所有方法均不抠图 ----
+methods:
+  gaussiansvr:
+    # 预设文件内的 max_iter 被 iters 覆盖；low_reso_stage / densify_* / position_lr_max_steps 按原比例缩放
+    preset: "GaussianSVR/config/default.yaml"
+    # 体网格各向同性分辨率（mm）；null 表示取面内 spacing
+    volume_resolution: null
+  gsvr:
+    # ACDC 为真实数据，采用真实数据预设（含逐层强度缩放与离群加权，二者不属于运动校正）
+    preset: "GSVR/configs/config_subjects_real.yaml"
+    # 原预设 500000 大于单例体素数（约 16 万）会触发断言，改为全批量（预设注释中的默认）
+    mini_batch_size: null
+  nesvor:
+    # 其余参数取 nesvor.cli.parsers.build_parser_training 的默认值
+    overrides: {}
+  eclare:
+    batch_size: 128
+    # 层面轮廓类型（ECLARE 预设 gaussian）；层厚取上面的统一设置，因此不运行 ESPRESO 估计
+    slice_profile_type: "gaussian"
+  dyna3dgr:
+    # stage1：只在初始帧 t=0 上拟合静态高斯（形变置零），迭代数 = iters；
+    # full：前 iterations_node_sampling（原预设 5000）步同 stage1，随后在所选帧上续跑原联合循环至 total_iters。
+    # total_iters 为原预设 20000；改动时 main() 中按步数写死的常数按比例缩放
+    stage: "stage1"
+    total_iters: 20000
+    # full 第二阶段使用的帧：ed_to_es 为 ED 到 ES 的连续帧（ACDC 6–16 帧）；ed_es 为原方法的 ED/ES 两帧；all 为完整序列
+    frames: "ed_to_es"
