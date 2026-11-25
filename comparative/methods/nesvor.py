@@ -3,12 +3,12 @@
 与原 CLI 流程的差异：
 - 每个训练层构造成一个 Slice（名义刚体变换 (0,0,z_k)、resolution_z = 层厚 FWHM），掩膜全为 True（不抠图）；
   不做 SVoRT 配准、分割与偏场校正。
-- no_transformation_optimization=True（运动校正统一关闭）；n_iter = cfg.iters，其余取原 parser 默认值。
+- no_transformation_optimization=True（运动校正统一关闭）；n_iter = cfg.iters（"preset" 时为默认 6000），其余取原 parser 默认值。
 - 采样输出用原 sample_slice（层面 PSF），但掩膜换成覆盖整个栈的全 1 体：原训练点占据掩膜在层间可能出现空洞。
 """
 import torch
 
-from case_data import query_index
+from case_data import query_index, resolve_iters
 
 
 def _slice(image, z_mm, case, device):
@@ -42,7 +42,7 @@ def fit(case, cfg, method_cfg, out_dir, **_):
     args = build_parser_training().parse_args([])
     for key, value in method_cfg.get('overrides', {}).items():
         setattr(args, key, value)
-    args.n_iter, args.n_epochs = cfg.iters, None
+    args.n_iter, args.n_epochs = resolve_iters(cfg, args.n_iter), None
     args.no_transformation_optimization = True
     args.device, args.dtype, args.debug = device, torch.float32, False
 
@@ -50,7 +50,6 @@ def fit(case, cfg, method_cfg, out_dir, **_):
     slices = [_slice(images[k], z, case, device)
               for k, z in zip(case.train_index, case.z_mm(case.train_index))]
     model, _, _ = train(slices, args)
-    torch.save(dict(state_dict=model.state_dict(), args=vars(args)), out_dir / 'nesvor_inr.pt')
 
     # 同原 sample_slices：先切到 eval（train 模式下 INR 返回 (density, pe, z) 元组）
     model.eval()
@@ -61,4 +60,5 @@ def fit(case, cfg, method_cfg, out_dir, **_):
         volume = torch.stack([
             sample_slice(model, _slice(blank, z, case, device), mask, n_samples=args.n_samples).image[0]
             for z in case.z_mm(query)])
-    return dict(query_index=query, volume=volume.cpu().numpy(), frame=case.reference_phase)
+    return dict(query_index=query, volume=volume.cpu().numpy(), frame=case.reference_phase,
+                iterations=args.n_iter)

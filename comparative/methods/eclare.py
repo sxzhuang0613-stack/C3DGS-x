@@ -3,7 +3,7 @@
 与原 run-eclare CLI 的差异：
 - 输入为内存数组 [H,W,N]（N 个等间隔训练层，lr_axis=2），不读 NIfTI；按原 parse_image 做 [0,1] min-max 归一化。
 - 层厚取统一设置（relative_slice_thickness = 层厚 / 面内 spacing），因此不运行 ESPRESO 估计层面轮廓。
-- 训练步数 n_patches / batch_size = cfg.iters（原默认 1e6 个 patch，batch 128，约 7813 步）。
+- 训练步数 n_patches / batch_size = cfg.iters；"preset" 时 n_patches 取原默认 1e6（batch 128，7813 步）。
 - 不传 inplane_acq_res：输出保持 Dataloader 的 128×128 网格，与其余方法逐像素可比。
 输出层位：原分辨率输出沿 z 先按原层面轮廓模糊（训练降质模型的前半部分），再在名义层位线性采样。
 """
@@ -11,7 +11,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from case_data import query_index
+from math import ceil
+
+from case_data import query_index, resolve_iters
+
+PRESET_N_PATCHES = 1000000   # 原 run-eclare 的 --n-patches 默认值
 
 
 def _hr_coordinate(train_coordinate, num_lr, num_hr, scale):
@@ -35,11 +39,12 @@ def fit(case, cfg, method_cfg, out_dir, **_):
     blur_kernel = parse_kernel(None, method_cfg['slice_profile_type'], case.thickness / inplane)
 
     batch_size = method_cfg['batch_size']
+    iterations = resolve_iters(cfg, ceil(PRESET_N_PATCHES / batch_size))
+    n_patches = PRESET_N_PATCHES if cfg.iters == 'preset' else iterations * batch_size
     dataset = TrainSet(image=image, lr_axis=2, verbose=False)
-    eclare_vol, state, _ = run_eclare(
+    eclare_vol, _, _ = run_eclare(
         image, slice_separation, [1, 1, 1], 2, None, None, orig_min, orig_max, blur_kernel,
-        dataset, device, batch_size=batch_size, n_patches=cfg.iters * batch_size)
-    torch.save(dict(state_dict=state, slice_separation=slice_separation), out_dir / 'eclare_wdsr.pt')
+        dataset, device, batch_size=batch_size, n_patches=n_patches)
 
     # 输出 [H,W,n] → 沿 z 按层面轮廓模糊（复制边界，避免端层被零填充拉暗）
     volume = torch.from_numpy(np.ascontiguousarray(eclare_vol)).float()
@@ -58,4 +63,5 @@ def fit(case, cfg, method_cfg, out_dir, **_):
     weight = torch.as_tensor(j - lower, dtype=torch.float32)[:, None, None]
     slices = blurred.permute(2, 0, 1)                                     # [n,H,W]
     prediction = slices[lower] * (1 - weight) + slices[upper] * weight
-    return dict(query_index=query, volume=prediction.numpy(), frame=case.reference_phase)
+    return dict(query_index=query, volume=prediction.numpy(), frame=case.reference_phase,
+                iterations=iterations)

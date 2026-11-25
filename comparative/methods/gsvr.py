@@ -4,7 +4,7 @@
 - load_data 改为由 CaseData 构造同结构张量（世界坐标 mm、逐层 PSF 协方差、包围盒），不读 NIfTI、不做 ANTs 预处理；
   全部像素参与监督（不抠图，等价于全 1 掩膜）。
 - motion_correction=False（统一关闭）；apply_mask=False（原掩膜为胎儿脑设计）。
-- max_epochs = cfg.iters（全批量，1 epoch = 1 次更新）；mini_batch_size 取对比配置（原值大于单例体素数会触发断言）。
+- max_epochs = cfg.iters（"preset" 时为预设 500；全批量，1 epoch = 1 次更新）；mini_batch_size 取对比配置（原值大于单例体素数会触发断言）。
 - 原训练末尾的 visualize_gaussians（体数据导出）被替换为截获模型，在名义层位用层面 PSF 采样输出。
 """
 from pathlib import Path
@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import yaml
 
-from case_data import use_reference, query_index
+from case_data import use_reference, query_index, resolve_iters
 
 REPO_SUBDIR = 'GSVR'
 
@@ -60,7 +60,8 @@ def fit(case, cfg, method_cfg, out_dir, **_):
 
     with open(Path(cfg.references_root) / method_cfg['preset'], encoding='utf-8') as stream:
         config = yaml.safe_load(stream)
-    config['gsvr'].update(max_epochs=cfg.iters, motion_correction=False,
+    iterations = resolve_iters(cfg, config['gsvr']['max_epochs'])
+    config['gsvr'].update(max_epochs=iterations, motion_correction=False,
                           mini_batch_size=method_cfg['mini_batch_size'])
     # reconstruction.spacing 只决定原代码预分配的可视化网格，此处取面内分辨率以免占用过多显存
     config['data']['reconstruction'].update(apply_mask=False,
@@ -86,7 +87,6 @@ def fit(case, cfg, method_cfg, out_dir, **_):
                      cfg_vis=None)
 
     model, gpu_topk, K = captured['model'], captured['gpu_topk'], captured['K']
-    torch.save(model.state_dict(), out_dir / 'gsvr_model.pt')
 
     # 名义层位：像素中心世界坐标 + 层面 PSF 协方差（与训练前向相同），再按原方式反归一化
     num_slices, height, width = case.shape
@@ -108,4 +108,4 @@ def fit(case, cfg, method_cfg, out_dir, **_):
             slices.append(values.view(height, width))
     volume = torch.stack(slices).cpu().numpy()
     volume = (volume * (data['max_value'] - data['min_value']) + data['min_value']).clip(0.0, None)
-    return dict(query_index=query, volume=volume, frame=case.reference_phase)
+    return dict(query_index=query, volume=volume, frame=case.reference_phase, iterations=iterations)

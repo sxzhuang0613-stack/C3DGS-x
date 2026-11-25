@@ -47,7 +47,8 @@ def main():
                         help='仅 dyna3dgr：stage1 只拟合初始帧静态高斯；full 为完整两阶段')
     parser.add_argument('--cases', nargs='*', default=None, help='覆盖配置中的病例列表')
     parser.add_argument('--protocol', choices=['observed', 'holdout'], default=None)
-    parser.add_argument('--iters', type=int, default=None, help='覆盖统一迭代数（如冒烟测试）')
+    parser.add_argument('--iters', type=lambda v: v if v == 'preset' else int(v), default=None,
+                        help='覆盖迭代数：正整数或 preset（各方法预设）')
     args = parser.parse_args()
     cfg = load_config(args.config)
     for key in ('cases', 'iters'):
@@ -80,11 +81,13 @@ def main():
 
         start = time.time()
         prediction = method.fit(case, cfg, method_cfg, out_dir, stage=stage)
-        elapsed = time.time() - start
+        elapsed = prediction.get('elapsed_seconds', time.time() - start)
 
         save_prediction(out_dir, case, prediction, cfg)
         record = dict(method=args.method, stage=stage, case=case.name, elapsed_seconds=elapsed,
                       eval_protocol=cfg.eval_protocol, iters=cfg.iters,
+                      iterations_run=prediction.get('iterations'),
+                      slice_thickness_mm=case.thickness,
                       random_seed=cfg.random_seed, method_config=method_cfg,
                       config=vars(cfg) | {'methods': None})
         (out_dir / 'run.json').write_text(json.dumps(record, ensure_ascii=False, indent=2,

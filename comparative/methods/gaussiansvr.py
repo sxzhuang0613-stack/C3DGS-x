@@ -4,7 +4,7 @@
 - 不运行 SVoRT：心脏单 stack 无多 stack 约束，且无适用的预训练权重；初始体改为训练层沿 z 的线性插值。
 - 逐层刚体参数固定为名义位姿（运动校正统一关闭），因此不建运动优化器与调度器。
 - 前景掩膜沿用原定义 init_vol > 0（不额外抠图）；背景点数取 min(预设, 可用零值体素数)。
-- max_iter = cfg.iters；low_reso_stage、densify_from/until、position_lr_max_steps 按原比例缩放。
+- max_iter = cfg.iters（"preset" 时为预设 10001）；low_reso_stage、densify_from/until、position_lr_max_steps 按原比例缩放。
 """
 from pathlib import Path
 
@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-from case_data import use_reference, query_index
+from case_data import use_reference, query_index, resolve_iters
 
 REPO_SUBDIR = 'GaussianSVR/src'
 
@@ -67,8 +67,9 @@ def fit(case, cfg, method_cfg, out_dir, **_):
     device = torch.device('cuda')
 
     # 迭代数统一；原预设里按绝对步数写死的里程碑按比例缩放
-    ratio = cfg.iters / config['max_iter']
-    config['max_iter'] = cfg.iters
+    iterations = resolve_iters(cfg, config['max_iter'])
+    ratio = iterations / config['max_iter']
+    config['max_iter'] = iterations
     config['low_reso_stage'] = int(round(config['low_reso_stage'] * ratio))
     config['densify_from_iter'] = int(round(config['densify_from_iter'] * ratio))
     config['densify_until_iter'] = int(round(config['densify_until_iter'] * ratio))
@@ -138,14 +139,11 @@ def fit(case, cfg, method_cfg, out_dir, **_):
             print(f'  iter {iteration + 1}/{config["max_iter"]} L1 {l1.item():.6f} '
                   f'TV {tv.item():.6f} N {gaussians.get_xyz.shape[0]}')
 
-    # 保存高斯参数，并以原前向模型（PSF 重扫描）在名义层位输出
-    torch.save(dict(xyz=gaussians._xyz.detach(), scaling=gaussians._scaling.detach(),
-                    rotation=gaussians._rotation.detach(), intensity=gaussians._intensity.detach(),
-                    volume_shape=(depth, height, width), resolution=resolution),
-               out_dir / 'gaussians.pt')
+    # 以原前向模型（PSF 重扫描）在名义层位输出；逐病例优化不保存权重
     query = query_index(case, cfg.interp_step_size)
     with torch.no_grad():
         _, volume = render_volume()
         slices = re_scanner.scan(volume, _slice_transforms(case, query, device), resolution,
                                  resolution_slice, case.thickness)
-    return dict(query_index=query, volume=slices[:, 0].cpu().numpy(), frame=case.reference_phase)
+    return dict(query_index=query, volume=slices[:, 0].cpu().numpy(), frame=case.reference_phase,
+                iterations=iterations)

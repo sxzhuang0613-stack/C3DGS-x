@@ -63,9 +63,11 @@ class GaussianModel:
     def get_time(self):
         return F.softmax(self.time_func.squeeze(), dim=0) if self.use_dff else self.time_func
 
-    def initialize_from_images(self, images, geometry, args, rendering, case_name):
+    def initialize_from_images(self, images, geometry, args, rendering, case_name,
+                               slice_index=None, num_slices=None):
         from .initialization import initialize_from_images
-        return initialize_from_images(self, images, geometry, args, rendering, case_name)
+        return initialize_from_images(self, images, geometry, args, rendering, case_name,
+                                      slice_index, num_slices)
 
     def training_setup(self, args):
         self.structural_args = args

@@ -8,6 +8,7 @@ from utils.CostFunctions import l1_loss, ssim, anisotropic_scale_loss, envelope_
 from utils.Renderer import render
 import argparse
 import random
+import time
 import numpy as np
 from utils.config_utils import load_config, setup_runtime, dataset_options, ssim_options, RENDER_SEMANTICS
 from utils.case_geometry import make_geometry, check_geometry, attach_geometry, save_model_ply, read_model_geometry
@@ -53,13 +54,15 @@ def update_loss_plot(out_dir, iters_list, loss_dict, dpi=150):
 
 # ==================== [功能模块 2: 周期性全序列快照重建 (含插帧联动)] ====================
 def reconstruct_full_case(Gaussians, imgs, out_dir, iter_num, include_interp, step_size=0.25,
-                          dpi=150, similarity=None, **render_kwargs):
-    """渲染整个病例并与原图并排拼成一张 PNG：reconstructions/iter_XXXXXX.png。
+                          dpi=150, similarity=None, roles=None, **render_kwargs):
+    """渲染整个病例并与原图并排拼成一张 PNG：reconstructions/final.png（只保存训练结束时的结果）。
 
     imgs 为参考相位原图 [S,H,W]。每个真实层显示"原图 | 渲染"并标注该层 PSNR/SSIM；
     进入插层训练后，同一行再接 k+step, k+2*step, ... 的插值渲染（无原图，不计指标）。
-    固定 [0,1] 灰度、最近邻显示，避免显示插值造成的额外模糊。
+    roles 为 {层号: 'held-out' | 'extrapolated'}（holdout 协议下未参与训练的层，红色标注）；
+    标题分别给出训练层与留出层（不含外推层）的平均指标。固定 [0,1] 灰度、最近邻显示。
     """
+    roles = roles or {}
     rec_dir = os.path.join(out_dir, "reconstructions")
     os.makedirs(rec_dir, exist_ok=True)
     s, h, w = imgs.shape
@@ -93,20 +96,29 @@ def reconstruct_full_case(Gaussians, imgs, out_dir, iter_num, include_interp, st
     for n, (k, gt, prediction, psnr_value, ssim_value, interps) in enumerate(rows):
         r, c = divmod(n, pairs_per_row)
         c *= cols // pairs_per_row
+        role, color = (f" ({roles[k]})", 'tab:red') if k in roles else ("", 'black')
         axes[r, c].imshow(gt, **show)
-        axes[r, c].set_title(f"GT {k}", fontsize=8)
+        axes[r, c].set_title(f"GT {k}{role}", fontsize=8, color=color)
         axes[r, c + 1].imshow(prediction, **show)
-        axes[r, c + 1].set_title(f"render {k}\nPSNR {psnr_value:.1f} SSIM {ssim_value:.3f}", fontsize=7)
+        axes[r, c + 1].set_title(f"render {k}\nPSNR {psnr_value:.1f} SSIM {ssim_value:.3f}",
+                                 fontsize=7, color=color)
         for j, (index, image) in enumerate(interps):
             axes[r, c + 2 + j].imshow(image, **show)
             axes[r, c + 2 + j].set_title(f"render {index:.2f}", fontsize=8, color='tab:blue')
-    mean_psnr = np.mean([row[3] for row in rows])
-    mean_ssim = np.mean([row[4] for row in rows])
-    fig.suptitle(f"iter {iter_num}   per-slice mean PSNR {mean_psnr:.2f} dB   SSIM {mean_ssim:.4f}"
-                 + ("   (blue = interpolated)" if include_interp else ""), fontsize=10)
+    def mean_text(selected):
+        return (f"PSNR {np.mean([row[3] for row in selected]):.2f} dB   "
+                f"SSIM {np.mean([row[4] for row in selected]):.4f}")
+    if roles:
+        train_rows = [row for row in rows if row[0] not in roles]
+        held_rows = [row for row in rows if roles.get(row[0]) == 'held-out']
+        summary = f"train {mean_text(train_rows)}" + (f"   held-out {mean_text(held_rows)}" if held_rows else "")
+    else:
+        summary = f"per-slice mean {mean_text(rows)}"
+    fig.suptitle(f"iter {iter_num}   {summary}" + ("   (blue = interpolated)" if include_interp else ""),
+                 fontsize=10)
     # 为总标题预留约 0.4 英寸，避免与首行子图标题重叠。
     fig.tight_layout(rect=(0, 0, 1, 1 - .4 / fig.get_figheight()))
-    fig.savefig(os.path.join(rec_dir, f"iter_{iter_num:06d}.png"), dpi=dpi)
+    fig.savefig(os.path.join(rec_dir, "final.png"), dpi=dpi)
     plt.close(fig)
     torch.cuda.empty_cache()
 
@@ -144,10 +156,11 @@ def append_structure_log(path, iteration, points, reports):
         csv.DictWriter(stream, fieldnames=STRUCTURE_FIELDS).writerow(row)
 
 
-def save_training_checkpoint(path, gaussians, iteration, history_iters, history_losses, args):
-    """保存拓扑、Adam 动量、增殖统计和随机状态；PLY 只用于交换模型。"""
+def save_training_checkpoint(path, gaussians, iteration, history_iters, history_losses, args,
+                             elapsed_seconds=0.):
+    """保存拓扑、Adam 动量、增殖统计、随机状态与累计训练用时；PLY 只用于交换模型。"""
     state = {
-        'iteration': iteration, 'config': vars(args),
+        'iteration': iteration, 'config': vars(args), 'elapsed_seconds': elapsed_seconds,
         'geometry': getattr(gaussians,'geometry',None),
         'geometry_reference_count': getattr(gaussians,'geometry_reference_count',len(gaussians.get_xyz)),
         'parameters': {name: getattr(gaussians, name).detach() for name in
@@ -202,7 +215,8 @@ def check_resume_config(saved, args):
             'densify_from_iter','densify_until_iter','densification_interval',
             'lambda_l1','lambda_ssim','lambda_anisotropic','lambda_interp_l1','lambda_interp_ssim',
             'lambda_interp_envelope',
-            'background','raster_debug','slice_thickness_fwhm_spacing','amplitude_cutoff')
+            'background','raster_debug','slice_thickness_fwhm_spacing','amplitude_cutoff',
+            'slice_protocol','holdout_stride')
     keys = set(keys)|{key for key in vars(args) if key.startswith('structural_')}
     changed = sorted(key for key in keys if key in saved and saved[key] != getattr(args,key))
     if changed:
@@ -217,28 +231,32 @@ def training(args):
     similarity = ssim_options(args)
     for sample_idx, data in enumerate(loader):
         sample_name = os.path.splitext(data['info']['filename'][0])[0]
-        case_dir = os.path.join(args.output_path, sample_name)
+        # 输出 <output_path>/<case>/<output_case_subdir>/；子目录为空时即旧布局 <output_path>/<case>/
+        case_dir = os.path.join(args.output_path, sample_name, args.output_case_subdir)
         checkpoint_path = os.path.join(case_dir, 'training_state.pth')
         final_ply = os.path.join(case_dir, 'point_cloud_final.ply')
+        # 训练完成后 checkpoint 被删除，是否已完成以最终 PLY 记录的步数判断
+        final_record = (read_model_geometry(final_ply)
+                        if args.stage1_skip_existing and os.path.isfile(final_ply) else None)
+        skip_existing = final_record is not None and final_record.get('iteration', 0) >= args.iters
         state = None
-        if (args.stage1_resume or args.stage1_skip_existing) and os.path.isfile(checkpoint_path):
+        if args.stage1_resume and not skip_existing and os.path.isfile(checkpoint_path):
             # 只加载本地可信训练文件；完整随机状态包含 NumPy 对象。
             state = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        skip_existing = (args.stage1_skip_existing and state is not None
-                         and state['iteration'] >= args.iters
-                         and (not args.save_ply or os.path.isfile(final_ply)))
-        if skip_existing and args.save_ply and state.get('geometry') is not None:
-            final_record = read_model_geometry(final_ply)
-            skip_existing = final_record is not None and final_record.get('iteration') == state['iteration']
-            if skip_existing:
-                check_geometry(state['geometry'],final_record['geometry'])
-        if state is not None and (args.stage1_resume or skip_existing):
             check_resume_config(state['config'],args)
         sequence = data['cmr'][0]
         imgs = sequence[:, args.reference_phase].to(args.device)
         s, h, w = imgs.shape
+        # holdout 只用 k % holdout_stride == 0 的层监督；几何仍按完整 s 层栈，
+        # 留出层图像不进入初始化、损失和结构统计
+        observed = (list(range(0, s, args.holdout_stride)) if args.slice_protocol == 'holdout'
+                    else list(range(s)))
+        roles = {k: 'held-out' if k < observed[-1] else 'extrapolated'
+                 for k in range(s) if k not in observed}
         record = None
-        if state is not None and (args.stage1_resume or skip_existing):
+        if skip_existing:
+            geometry = final_record['geometry']
+        elif state is not None:
             geometry = state.get('geometry')
             if geometry is None:
                 raise ValueError('旧 checkpoint 缺少渲染和几何记录，不能按 alpha 模型恢复')
@@ -253,19 +271,20 @@ def training(args):
         check_geometry(geometry,current)
         rendering = geometry['rendering']
         if skip_existing:
-            tqdm.write(f'[{sample_name}] 已完成 {state["iteration"]} 步，跳过。')
+            tqdm.write(f'[{sample_name}] 已完成 {final_record["iteration"]} 步，跳过。')
             continue
         os.makedirs(case_dir, exist_ok=True)
         gaussians = GaussianModel()
         attach_geometry(gaussians,geometry)
         history_iters, history_losses = [], {}
-        start_iteration = 0
-        if args.stage1_resume and state is not None:
+        start_iteration, elapsed_before = 0, 0.
+        if state is not None:
             tqdm.write(f'[{sample_name}] 续训已有参数，初始化不重新执行。')
             restore_training_checkpoint(state, gaussians, args)
             start_iteration = state['iteration']
             history_iters = state['history_iters']
             history_losses = state['history_losses']
+            elapsed_before = state.get('elapsed_seconds', 0.)
         else:
             if args.warm_start_ply_path:
                 gaussians.load_ply(args.warm_start_ply_path,
@@ -273,7 +292,8 @@ def training(args):
                 if record is not None:
                     gaussians.geometry_reference_count = record['geometry_reference_count']
             else:
-                gaussians.initialize_from_images(imgs,geometry,args,rendering,sample_name)
+                gaussians.initialize_from_images(imgs[observed],geometry,args,rendering,sample_name,
+                                                 observed,s)
             gaussians.training_setup(args)
 
         with torch.no_grad():
@@ -286,6 +306,7 @@ def training(args):
         # 加和模型用逐切片梯度统计 + 闭式判据；旧 alpha 模型保持原残差门控流程
         additive = args.structural_algorithm == 'additive_moment_v1'
         structural_step = gaussians.structural_step_additive if additive else gaussians.structural_step
+        start_time = time.time()
         pbar = tqdm(range(start_iteration + 1, args.iters + 1),
                     desc=f'Case [{sample_idx + 1}/{len(loader)}] {sample_name}')
         for iteration in pbar:
@@ -293,7 +314,7 @@ def training(args):
             # 同一优化步的真实切片与插层共享几何图；更新参数后下一步重新构造。
             covariance = covariance_from_scaling_rotation(gaussians.get_scaling, gaussians._rotation)
             # 无放回均匀采样，单层和双层病例也能获得真实监督。
-            indices = random.sample(range(s), min(s, args.real_slices_per_iter))
+            indices = random.sample(observed, min(len(observed), args.real_slices_per_iter))
             outputs = [render(gaussians, [h, w], index, 2, s, covariance=covariance, **rendering)
                        for index in indices]
             # 结构统计只用真实切片；插层平面没有观测，不参与增殖判据
@@ -307,25 +328,28 @@ def training(args):
                 reference_count=gaussians.geometry_reference_count)
             zero = imgs.new_zeros(())
             loss_interp_l1, loss_interp_ssim, loss_envelope = zero, zero, zero
-            if args.interpolation and iteration >= args.interpolate_iter and s > 1:
+            # 插层区间取相邻两观测层 [observed[j], observed[j+1]]；全层训练时即 [k, k+1]
+            n_observed = len(observed)
+            if args.interpolation and iteration >= args.interpolate_iter and n_observed > 1:
                 if random.random() < args.interpolation_probability:
                     alpha = random.uniform(args.interpolation_alpha_min,
                                            args.interpolation_alpha_max)
-                    left = random.randrange(max(1, s - 2))
-                    intervals = range(left, min(left + 2, s - 1))
+                    left = random.randrange(max(1, n_observed - 2))
+                    intervals = range(left, min(left + 2, n_observed - 1))
                     interp_pred, lower, upper = [], [], []
-                    for index in intervals:
-                        output = render(gaussians, [h, w], index + alpha, 2, s,
+                    for j in intervals:
+                        below, above = observed[j], observed[j + 1]
+                        output = render(gaussians, [h, w], below + alpha * (above - below), 2, s,
                                         covariance=covariance, **rendering)
                         outputs.append(output)
                         interp_pred.append(output['render'])
-                        lower.append(torch.minimum(imgs[index], imgs[index + 1]))
-                        upper.append(torch.maximum(imgs[index], imgs[index + 1]))
+                        lower.append(torch.minimum(imgs[below], imgs[above]))
+                        upper.append(torch.maximum(imgs[below], imgs[above]))
                     # 无层间真值：区间约束防止越界伪影，不拟合像素级线性混合（避免双重轮廓）。
                     loss_envelope = envelope_loss(torch.stack(interp_pred), torch.stack(lower),
                                                   torch.stack(upper))
                 else:
-                    index = random.randrange(s)
+                    index = observed[random.randrange(n_observed)]
                     output = render(gaussians, [h, w], index, 2, s, covariance=covariance, **rendering)
                     outputs.append(output)
                     real_outputs.append((output, index))
@@ -377,19 +401,23 @@ def training(args):
             if iteration % args.structure_log_interval == 0 or iteration == args.iters:
                 append_structure_log(structure_log, iteration, gaussians.get_xyz.shape[0], structure_reports)
                 structure_reports = []
-            if (args.visualize and args.reconstruct_interval > 0
-                    and iteration % args.reconstruct_interval == 0):
-                reconstruct_full_case(
-                    gaussians, imgs, case_dir, iteration,
-                    args.interpolation and iteration >= args.interpolate_iter,
-                    args.interp_step_size, args.plot_dpi, similarity, **rendering)
-            if args.save_ply and iteration in args.save_iterations:
-                save_model_ply(gaussians,os.path.join(case_dir, f'point_cloud_iter_{iteration:06d}.ply'),iteration)
+            # checkpoint 只用于中断续训；正常结束后删除，只保留 final 权重
             if iteration % args.checkpoint_interval == 0 or iteration == args.iters:
                 save_training_checkpoint(checkpoint_path, gaussians, iteration,
-                                         history_iters, history_losses, args)
+                                         history_iters, history_losses, args,
+                                         elapsed_before + time.time() - start_time)
+        elapsed = elapsed_before + time.time() - start_time
         if args.save_ply:
-            save_model_ply(gaussians,final_ply,max(start_iteration,args.iters))
+            training_record = dict(slice_protocol=args.slice_protocol, observed_slices=observed,
+                                   num_slices=s, elapsed_seconds=elapsed)
+            save_model_ply(gaussians,final_ply,max(start_iteration,args.iters),training_record)
+        if args.visualize:
+            reconstruct_full_case(
+                gaussians, imgs, case_dir, max(start_iteration, args.iters),
+                args.interpolation and args.iters >= args.interpolate_iter,
+                args.interp_step_size, args.plot_dpi, similarity, roles, **rendering)
+        if args.save_ply and os.path.isfile(checkpoint_path):
+            os.remove(checkpoint_path)
         del gaussians, state
         torch.cuda.empty_cache()
 

@@ -23,11 +23,15 @@ reference_phase: 0
 eval_protocol: "observed"
 holdout_stride: 2
 
-# 逐病例迭代方法统一的迭代数（GaussianSVR max_iter、GSVR max_epochs、NeSVoR n_iter、
-# ECLARE 训练步数、Dyna3DGR stage1）；各方法内部按绝对步数写死的里程碑按原比例缩放
-iters: 20000
+# 逐病例迭代方法的迭代数（GaussianSVR max_iter、GSVR max_epochs、NeSVoR n_iter、ECLARE 训练步数、
+# Dyna3DGR stage1）。整数：统一使用该值，方法内部按绝对步数写死的里程碑按原比例缩放；
+# "preset"：各方法论文/代码预设（10001 / 500 / 6000 / 7813 / 5000，Dyna3DGR stage1 取原 iterations_node_sampling）
+iters: "preset"
 
-# 层面轮廓：FWHM = slice_thickness_fwhm_spacing × sz（与 C3DGS 相同；数据无层厚元数据，此值为实现选择）
+# 层面轮廓 FWHM（mm）：数值时所有病例统一取该值；null 时取 slice_thickness_fwhm_spacing × sz，
+# sz 为 Dataloader 给出的逐例层距（数据不含单独的层厚字段）。与 C3DGS 的 slice_thickness_fwhm_spacing 一致。
+# holdout 时层厚仍为原层距 sz（采集属性），训练层间距为 holdout_stride·sz
+slice_thickness_mm: null
 slice_thickness_fwhm_spacing: 1.0
 # 插层输出步长（以层间距为单位），1/interp_step_size 须为整数，使整数层位落在输出网格上
 interp_step_size: 0.25
@@ -48,6 +52,11 @@ save_images: true
 
 # ---- 各方法设置：未列出的超参数保持各方法预设；运动校正统一关闭，所有方法均不抠图 ----
 methods:
+  c3dgs:
+    # 本方法：先用 C3DGS 的 GetInitialGaussian.py 训练（dataset_mode val、slice_protocol 与 eval_protocol 相同、
+    # output_case_subdir 为协议名），此处读取 <model_root>/<case>/<protocol>/point_cloud_final.ply 渲染
+    model_root: "/home/exouser/codes/OutPut/C3DGS"
+    legacy_color_policy: "strict"
   gaussiansvr:
     # 预设文件内的 max_iter 被 iters 覆盖；low_reso_stage / densify_* / position_lr_max_steps 按原比例缩放
     preset: "GaussianSVR/config/default.yaml"

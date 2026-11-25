@@ -130,6 +130,13 @@ def load_config(path):
                 raise ValueError(f'{key} 必须为布尔值')
         if not isinstance(values['visualize'], bool):
             raise ValueError('visualize 必须为布尔值')
+        if values['slice_protocol'] not in ('observed', 'holdout'):
+            raise ValueError('slice_protocol 必须为 observed 或 holdout')
+        if not isinstance(values['holdout_stride'], int) or values['holdout_stride'] < 2:
+            raise ValueError('holdout_stride 必须为不小于 2 的整数')
+        # 旧 alpha 结构算法的贡献审计逐层渲染全部图像，会让留出层进入训练
+        if values['slice_protocol'] == 'holdout' and values['structural_algorithm'] != 'additive_moment_v1':
+            raise ValueError('holdout 协议只支持 additive_moment_v1 结构算法')
         if not isinstance(values['structural_prune_after_densify'], bool):
             raise ValueError('structural_prune_after_densify 必须为布尔值')
         if not math.isfinite(values['structural_split_sigma_pixels']) or values['structural_split_sigma_pixels'] <= 0:

@@ -51,11 +51,18 @@ def load_config(path):
     steps_per_slice = 1 / values['interp_step_size']
     if abs(steps_per_slice - round(steps_per_slice)) > 1e-6:
         raise ValueError('1/interp_step_size 必须为整数')
+    if values['iters'] != 'preset' and not (isinstance(values['iters'], int) and values['iters'] > 0):
+        raise ValueError('iters 必须为正整数或 "preset"')
     if values['eval_protocol'] not in ('observed', 'holdout'):
         raise ValueError('eval_protocol 必须为 observed 或 holdout')
     if values['eval_protocol'] == 'holdout' and values['holdout_stride'] < 2:
         raise ValueError('holdout_stride 至少为 2')
     return argparse.Namespace(**values)
+
+
+def resolve_iters(cfg, preset):
+    """cfg.iters 为 "preset" 时返回方法预设迭代数，否则返回统一迭代数。"""
+    return int(preset) if cfg.iters == 'preset' else int(cfg.iters)
 
 
 def seed_everything(seed):
@@ -76,7 +83,7 @@ class CaseData:
     name: str
     sequence: torch.Tensor
     spacing: tuple          # (sx, sy, sz)，mm
-    thickness: float        # 层面轮廓 FWHM，mm
+    thickness: float        # 层面轮廓 FWHM（层厚），mm
     reference_phase: int
     time_indices: list      # ED/ES 对应帧
     train_index: np.ndarray
@@ -138,7 +145,8 @@ def iter_cases(cfg):
             continue
         yield CaseData(
             name=case_name, sequence=sequence, spacing=spacing,
-            thickness=cfg.slice_thickness_fwhm_spacing * spacing[2],
+            thickness=(cfg.slice_thickness_mm if cfg.slice_thickness_mm is not None
+                       else cfg.slice_thickness_fwhm_spacing * spacing[2]),
             reference_phase=cfg.reference_phase,
             time_indices=[int(t) for t in item['info']['time_indices']],
             train_index=train, test_index=test, stride=stride,

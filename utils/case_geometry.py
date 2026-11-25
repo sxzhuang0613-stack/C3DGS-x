@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from config_utils import render_options, RENDER_MODEL, ADDITIVE_RENDER_MODEL, RENDER_SEMANTICS
+from utils.config_utils import render_options, RENDER_MODEL, ADDITIVE_RENDER_MODEL, RENDER_SEMANTICS
 
 # 层面轮廓 FWHM 与高斯标准差之比 2·sqrt(2 ln 2)；与 diff_gaussian_rasterization_mri.FWHM_TO_SIGMA 相同，
 # 此处不导入 CUDA 扩展，使 CPU 几何检查不依赖编译库
@@ -63,14 +63,16 @@ def attach_geometry(model, geometry):
     model.intensity_softplus = geometry.get('intensity_semantics') == 'peak_density_softplus'
 
 
-def save_model_ply(model, path, iteration=None):
-    """旧 PLY 字段不变；哈希防止中断后将旧几何记录误配给新 PLY。"""
+def save_model_ply(model, path, iteration=None, training=None):
+    """旧 PLY 字段不变；哈希防止中断后将旧几何记录误配给新 PLY。training 为可选的训练记录（协议、训练层、用时）。"""
     model.save_ply(str(path)+'.tmp')
     os.replace(str(path)+'.tmp',path)
     record = dict(geometry=model.geometry,
                   geometry_reference_count=model.geometry_reference_count,
                   iteration=iteration,
                   ply_sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest())
+    if training is not None:
+        record['training'] = training
     sidecar = str(path)+'.geometry.json'
     with open(sidecar+'.tmp','w',encoding='utf-8') as stream:
         json.dump(record,stream,ensure_ascii=False,indent=2,allow_nan=False)

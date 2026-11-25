@@ -73,18 +73,20 @@ CG 预算耗尽不等于收敛，初始化报告包含相对残差和拟合前�
 
 ## 保存和恢复
 
-Stage1 每例保存：
+Stage1 每例保存（只保留最终结果）：
 
-- `training_state.pth`：参数、Adam 动量、迭代次数、增殖统计、随机状态和损失历史。
-- `point_cloud_iter_*.ply` / `point_cloud_final.ply`：用于模型交换的参考高斯。
-- 每个新 PLY 的 `.geometry.json`：spacing、病例 bounds、缩放因子、参考相位、归一化、渲染条件、固定几何正则参考容量、迭代号及 PLY 哈希；必须随 PLY 一起复制。
-- `reconstructions/iter_XXXXXX.png`：`visualize: true` 时每 `reconstruct_interval` 步一张全病例拼图，每个真实层"原图 | 渲染"并排并标注该层 PSNR/SSIM；进入插层训练后同一行再接按 `interp_step_size` 渲染的插值层（蓝色标注，无原图）。
+- `point_cloud_final.ply`：用于模型交换的参考高斯；不再保存中间步数的 PLY。
+- `point_cloud_final.ply.geometry.json`：spacing、病例 bounds、缩放因子、参考相位、归一化、渲染条件、固定几何正则参考容量、迭代号、PLY 哈希，以及 `training`（`slice_protocol`、训练层 `observed_slices`、`elapsed_seconds`）；必须随 PLY 一起复制。
+- `reconstructions/final.png`：`visualize: true` 时训练结束保存一张全病例拼图，每个真实层"原图 | 渲染"并排并标注该层 PSNR/SSIM，同一行再接按 `interp_step_size` 渲染的插值层（蓝色标注，无原图）；holdout 下未参与训练的层红色标注，标题分列训练层与留出层平均指标。
 - `loss_curves.png`：各损失随迭代的曲线，每 `loss_plot_interval` 步覆盖更新。
 - `structure_log.csv`：每 `structure_log_interval`（默认 500）步一行，汇总窗口内各结构周期的 split、split_size（尺寸超限拆分）、pruned/pruned_box、selected、residual_high（残差门放行）、eligible 之和，以及最后一次的梯度门限与 W、E/W、面内 σ 中位数和当前点数；续训时截掉超过起点的行。
+- `training_state.pth`：参数、Adam 动量、迭代次数、增殖统计、随机状态、损失历史和累计用时；只在训练中每 `checkpoint_interval` 步写出用于中断续训，最终 PLY 写出后删除。
 
-默认输出根目录为 `/home/exouser/codes/OutPut/C3DGS`，每例写入 `<根目录>/<病例名>/`。
+默认输出根目录为 `/home/exouser/codes/OutPut/C3DGS`，每例写入 `<根目录>/<病例名>/<output_case_subdir>/`（子目录默认为空）。
 
-默认从完整训练状态恢复；只在迭代已完成且所需最终产物存在时跳过病例。`warm_start_ply_path` 仅用于模型参数热启动，不表示完整续训。恢复的随机状态要求使用相同数据、设备布局和实验参数；CUDA 原子累加仍可能产生非确定性。
+层监督协议 `slice_protocol`：`observed` 用全部层；`holdout` 只用 `k % holdout_stride == 0` 的层，初始化、损失、插层包络与结构统计均不读取留出层，几何仍按完整层栈，插层区间取相邻两训练层之间（仅支持 `additive_moment_v1`）。
+
+默认从完整训练状态恢复；最终 PLY 记录的迭代数达到 `iters` 时跳过病例。`warm_start_ply_path` 仅用于模型参数热启动，不表示完整续训。恢复的随机状态要求使用相同数据、设备布局和实验参数；CUDA 原子累加仍可能产生非确定性。
 新 checkpoint 保存相同几何记录；恢复、测试和 Stage2 读取时核对坐标/观测条件。
 Stage1 拒绝将旧加性 checkpoint 或无语义记录的 PLY 自动解释为局部强度；新记录包含 `render_model`、`intensity_semantics`、`opacity_mode=fixed_one` 和 `rasterizer_api_version=2`。新最终 PLY 记录缺失时，可通过匹配的完整 checkpoint 重建产物。
 续训允许延长迭代数和改变保存频率，拒绝混用已改变的 Stage1 优化条件；初始化不会在续训时重新执行。

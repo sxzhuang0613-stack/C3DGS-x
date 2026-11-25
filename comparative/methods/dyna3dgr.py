@@ -1,6 +1,7 @@
 """Dyna3DGR（MICCAI 2025）适配：把原 train.main() 拆成两个阶段。
 
-stage1：只在初始帧 t=0 上拟合静态高斯（d_xyz=0、d_scaling=1、无密度残差），只更新高斯参数，迭代数 = cfg.iters。
+stage1：只在初始帧 t=0 上拟合静态高斯（d_xyz=0、d_scaling=1、无密度残差），只更新高斯参数，迭代数 = cfg.iters；
+        原实现无独立阶段 1，"preset" 时取 full 中静态段的长度 iterations_node_sampling（原 5000）。
 full：  原 main() 全流程（总步数 total_iters，原预设 20000）。前 iterations_node_sampling（原 5000）步按 stage1
         静态拟合，之后从该步数接续原联合循环（所选帧、形变网络与高斯同时优化，含原 5000/10000 步的特殊分支）。
 与原实现的其余差异：
@@ -17,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from case_data import use_reference
+from case_data import use_reference, resolve_iters
 
 REPO_SUBDIR = 'Dyna3DGR'
 ORIGINAL_TOTAL_ITERS = 20000
@@ -109,7 +110,8 @@ def fit(case, cfg, method_cfg, out_dir, stage='stage1', **_):
         return {k: v.clone().detach() for k, v in deform.deform.state_dict().items()}
 
     # 阶段 1：初始帧静态拟合；full 时长度为原 iterations_node_sampling
-    stage1_iters = cfg.iters if stage == 'stage1' else opt.iterations_node_sampling
+    stage1_iters = (resolve_iters(cfg, opt.iterations_node_sampling) if stage == 'stage1'
+                    else opt.iterations_node_sampling)
     best_loss, best_state = float('inf'), None
     for iteration in range(stage1_iters):
         gaussians = deform.deform.as_gaussians
@@ -129,10 +131,10 @@ def fit(case, cfg, method_cfg, out_dir, stage='stage1', **_):
 
     if stage == 'stage1':
         deform.deform.load_state_dict(best_state)
-        torch.save(deform.deform.state_dict(), out_dir / 'deform_stage1.pth')
         with torch.no_grad():
             volume = render_static().permute(2, 0, 1).cpu().numpy()
-        return dict(query_index=np.arange(depth) * cfg.interp_step_size, volume=volume, frame=0)
+        return dict(query_index=np.arange(depth) * cfg.interp_step_size, volume=volume, frame=0,
+                    iterations=stage1_iters)
 
     # 阶段 2：接续原联合循环（iteration_node_rendering 从 iterations_node_sampling 开始计）
     # 时间输入 t=index/len(frames)，ED 对应 t=0（同原实现以首帧为时间原点）
@@ -189,9 +191,8 @@ def fit(case, cfg, method_cfg, out_dir, stage='stage1', **_):
                 print(f'  stage2 iter {iteration} train L1 {loss.item():.6f} val L1 {val_loss:.6f}')
 
     deform.deform.load_state_dict(best_state)
-    torch.save(dict(state_dict=deform.deform.state_dict(), frames=frames), out_dir / 'deform_full.pth')
     with torch.no_grad():
         sequence = torch.stack([render_frame(i, total_frame).permute(2, 0, 1)
                                 for i in range(total_frame)]).cpu().numpy()
     return dict(query_index=np.arange(depth) * cfg.interp_step_size, volume=sequence[0],
-                frame=frames[0], sequence=sequence, frames=frames)
+                frame=frames[0], sequence=sequence, frames=frames, iterations=total)

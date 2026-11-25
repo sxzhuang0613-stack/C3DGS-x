@@ -108,8 +108,9 @@ class ReconstructionSnapshotTests(unittest.TestCase):
             stage1.reconstruct_full_case(model, images, directory, 6000, True, .25, dpi=40)
             self.assertEqual(indices, [i*.25 for i in range(17)])
             files = sorted(p.name for p in (Path(directory)/'reconstructions').iterdir())
-            self.assertEqual(files, ['iter_002000.png', 'iter_006000.png'])
-            Image.open(Path(directory)/'reconstructions'/'iter_006000.png').verify()
+            # 只保留最终拼图，后一次调用覆盖前一次
+            self.assertEqual(files, ['final.png'])
+            Image.open(Path(directory)/'reconstructions'/'final.png').verify()
 
 
 class InitializationTests(unittest.TestCase):
@@ -262,7 +263,7 @@ class CudaInitializationTests(unittest.TestCase):
                 training(args)
                 ply=Path(args.output_path)/'synthetic'/'point_cloud_final.ply'
                 Path(str(ply)+'.geometry.json').unlink()
-                # 模拟最终 PLY 记录尚未写完；完整 checkpoint 可重建产物。
+                # 模拟最终 PLY 记录缺失：完成后 checkpoint 已删除，按未完成病例重新训练。
                 training(args)
             record=read_model_geometry(ply)
             self.assertEqual(record['iteration'],3)
@@ -275,9 +276,9 @@ class CudaInitializationTests(unittest.TestCase):
             self.assertEqual([int(row['structure_steps']) for row in rows],[1,1,0])
             self.assertEqual(rows[-1]['grad_threshold'],'')
             self.assertEqual(int(rows[-1]['points']),int(rows[-2]['points']))
-            state=torch.load(ply.parent/'training_state.pth',map_location='cpu',weights_only=False)
-            self.assertEqual(state['iteration'],3)
-            check_geometry(state['geometry'],record['geometry'])
+            # 正常结束后只保留 final 权重，续训 checkpoint 已删除
+            self.assertFalse((ply.parent/'training_state.pth').exists())
+            self.assertEqual(record['training']['observed_slices'],[0,1])
             # 同一 PLY 经过真实评估入口，核对数据、几何记录与新版渲染接口。
             from evaluate import evaluate
             evaluation=load_config(ROOT/'config_test.yaml')

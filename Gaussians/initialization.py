@@ -20,8 +20,12 @@ def _sampling_maps(images, args):
     return normalized, foreground
 
 
-def _sample_positions(images, spacing, box, count, args, generator, guided=True):
+def _sample_positions(images, spacing, box, count, args, generator, guided=True,
+                      slice_index=None, num_slices=None):
+    """在观测层上采样初始中心（病例局部坐标）；images [N,H,W] 为第 slice_index 层（完整栈共 num_slices 层）。"""
     slices, height, width = images.shape
+    slice_index = torch.arange(slices) if slice_index is None else torch.as_tensor(slice_index)
+    num_slices = slices if num_slices is None else num_slices
     device = images.device
     uniform_count = round(count*args.init_uniform_fraction) if guided else count
     foreground_count = min(round(count*args.init_foreground_fraction),count-uniform_count) if guided else 0
@@ -70,7 +74,9 @@ def _sample_positions(images, spacing, box, count, args, generator, guided=True)
             positions.append(torch.stack((indices//(height*width),
                 (indices//width)%height+jitter[:,1],indices%width+jitter[:,0]),1))
     locations = torch.cat(positions)
-    z = (locations[:,0]-(slices-1)/2)*spacing[2]
+    # 观测图序号 → 完整栈层号，z 按完整栈居中，使 holdout 时训练层位置与全层训练一致
+    layers = slice_index.to(device)[locations[:,0].long()].to(locations)
+    z = (layers-(num_slices-1)/2)*spacing[2]
     # 观测框按每层代表厚度 sz 的薄片定义，首末层与中间层的法向抖动对称。
     lower = (z-args.init_normal_jitter*spacing[2]).clamp_min(-box[2])
     upper = (z+args.init_normal_jitter*spacing[2]).clamp_max(box[2])
@@ -93,8 +99,11 @@ def _mean_knn_sq_distance(points, neighbors=3, chunk=2048):
 
 class IntensityOperator:
     """固定几何、固定 opacity 的 alpha 颜色线性算子及伴随；不构造稠密响应矩阵。"""
-    def __init__(self, model, images, rendering):
+    def __init__(self, model, images, rendering, slice_index=None, num_slices=None):
+        # images [N,H,W] 为完整栈（共 num_slices 层）中第 slice_index 层的观测
         self.model, self.images = model, images
+        self.slice_index = list(range(len(images))) if slice_index is None else [int(k) for k in slice_index]
+        self.num_slices = len(images) if num_slices is None else num_slices
         self.rendering = dict(rendering,raster_options=dict(rendering['raster_options'],background=0.))
         # CG 期间几何固定，协方差只构造一次；xyz 仍共享数据以支持未观测点重采样。
         self.parameters = dict(
@@ -104,7 +113,7 @@ class IntensityOperator:
         )
 
     def view(self, coefficients, index):
-        return render(self.model,list(self.images.shape[-2:]),index,2,len(self.images),
+        return render(self.model,list(self.images.shape[-2:]),self.slice_index[index],2,self.num_slices,
                       colors=coefficients[:,None],**self.parameters,**self.rendering)
 
     @torch.no_grad()
@@ -131,18 +140,22 @@ class IntensityOperator:
 
 
 @torch.no_grad()
-def initialize_from_images(model, images, geometry, args, rendering, case_name):
+def initialize_from_images(model, images, geometry, args, rendering, case_name,
+                           slice_index=None, num_slices=None):
+    """由观测层初始化高斯；holdout 时 images 只含训练层 [N,H,W]，slice_index 为其完整栈层号。"""
     if not torch.isfinite(images).all():
         raise ValueError('初始化图像含非有限值')
     seed = int.from_bytes(hashlib.blake2b(
         f'{args.random_seed}:{case_name}'.encode(),digest_size=8).digest(),'little')
     generator = torch.Generator(device=images.device).manual_seed(seed)
     spacing = images.new_tensor(geometry['spacing_xyz'])/geometry['scale_mm']
-    slices, height, width = images.shape
-    # 观测体积半边长 [W*sx,H*sy,S*sz]/2；bounds 只定义渲染坐标归一化，不在此改变。
+    height, width = images.shape[-2:]
+    slices = len(images) if num_slices is None else num_slices
+    # 观测体积半边长 [W*sx,H*sy,S*sz]/2（S 为完整栈层数）；bounds 只定义渲染坐标归一化，不在此改变。
     box = spacing*images.new_tensor([width,height,slices])/2
+    layout = dict(slice_index=slice_index, num_slices=num_slices)
     count = args.num_pts
-    points = _sample_positions(images,spacing,box,count,args,generator)
+    points = _sample_positions(images,spacing,box,count,args,generator,**layout)
     # 经典 3DGS 初始尺度：各向同性，sigma=sqrt(到最近 3 个点平方距离的均值)；
     # 不为层间覆盖设置法向尺度，下界与训练一致为 min_sigma_pixels 个面内像素。
     floor = args.min_sigma_pixels*spacing[:2].min()
@@ -160,7 +173,7 @@ def initialize_from_images(model, images, geometry, args, rendering, case_name):
     model._rotation = nn.Parameter(rotations)
     model._intensity = nn.Parameter(images.new_ones(count,1))
     model.geometry_reference_count = count
-    operator = IntensityOperator(model,images,rendering)
+    operator = IntensityOperator(model,images,rendering,**layout)
     dropped = 0
     for attempt in range(args.init_support_retries+1):
         field,visible = operator.forward(torch.ones(count,device=images.device),visibility=True)
@@ -176,13 +189,14 @@ def initialize_from_images(model, images, geometry, args, rendering, case_name):
                 setattr(model, name, nn.Parameter(getattr(model, name)[visible]))
             count = len(model._xyz)
             model.geometry_reference_count = count
-            operator = IntensityOperator(model,images,rendering)
+            operator = IntensityOperator(model,images,rendering,**layout)
             field = operator.forward(torch.ones(count,device=images.device))
             break
-        model._xyz[~visible] = _sample_positions(images,spacing,box,int((~visible).sum()),args,generator,guided=False)
+        model._xyz[~visible] = _sample_positions(images,spacing,box,int((~visible).sum()),args,generator,
+                                                 guided=False,**layout)
         # 尺度由最终位置决定：重采样后重算 kNN 尺度，并按新几何重建线性算子。
         model._scaling.copy_(classic_log_scales(model._xyz))
-        operator = IntensityOperator(model,images,rendering)
+        operator = IntensityOperator(model,images,rendering,**layout)
     additive = rendering.get('render_model') == 'additive_slab_v1'
     if additive:
         # 加和模型 C = bg + A·I：背景与高斯无关，为常数

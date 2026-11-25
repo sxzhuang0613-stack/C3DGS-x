@@ -41,9 +41,12 @@ ssim_k2: 0.03
 data_range: 1.0
 
 # 输出与模型路径
-# 每例输出 <output_path>/<case>/：training_state.pth、PLY 及几何记录、loss_curves.png（每 loss_plot_interval 覆盖）、
-# reconstructions/iter_XXXXXX.png（每 reconstruct_interval 一张全切片拼图）。旧实验结果保留在 /home/exouser/Outputs/C3DGS
+# 每例输出 <output_path>/<case>/<output_case_subdir>/：point_cloud_final.ply 及几何记录（含协议、训练层与用时）、
+# loss_curves.png（每 loss_plot_interval 覆盖）、structure_log.csv、reconstructions/final.png（训练结束时一张全切片拼图）。
+# training_state.pth 只在训练中用于续训，正常结束后删除。旧实验结果保留在 /home/exouser/Outputs/C3DGS
 output_path: "/home/exouser/codes/OutPut/C3DGS"
+# 病例目录下的子目录（如 observed / holdout）；空字符串即 <output_path>/<case>/，与 Stage2 读取的旧布局一致
+output_case_subdir: ""
 stage1_model_root: "/home/exouser/codes/OutPut/C3DGS"
 stage2_output_path: "/home/exouser/codes/OutPut/C3DGS/stage2_experiments"
 
@@ -54,13 +57,11 @@ stage1_skip_existing: true
 warm_start_ply_path: ""
 checkpoint_interval: 1000
 save_ply: true
-save_iterations: [10000, 20000]
 loss_plot_interval: 1000
 # 每隔该步数把窗口内各结构周期的 split/剪枝/放行数与门限汇总写入 <case>/structure_log.csv
 structure_log_interval: 500
-# 是否每 reconstruct_interval 步保存"原图 | 渲染"并排拼图（含逐层 PSNR/SSIM）
+# 训练结束时是否保存"原图 | 渲染 | 插层"拼图（含逐层 PSNR/SSIM）
 visualize: true
-reconstruct_interval: 2000
 interp_step_size: 0.25
 status_interval: 10
 plot_dpi: 150
@@ -103,6 +104,11 @@ log_scale_min: -10.0
 log_scale_max: 10.0
 # 任一局部轴标准差不小于该面内像素数；像素中心采样、无抗锯齿时更细的核退化为脉冲
 min_sigma_pixels: 0.5
+
+# 层监督协议：observed 用全部层；holdout 只用 k % holdout_stride == 0 的层（留出层评估层间重建），
+# 几何仍按完整层栈，插层区间取相邻两训练层之间
+slice_protocol: "observed"
+holdout_stride: 2
 
 # 真实切片采样及空间插层监督
 real_slices_per_iter: 2
